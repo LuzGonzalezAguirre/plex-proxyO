@@ -889,3 +889,298 @@ def production_range(req: ProductionRangeRequest):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+# ─── Maintenance KPIs ─────────────────────────────────────────────────────────
+
+class MaintenanceKPIRequest(BaseModel):
+    start_date: str  # YYYY-MM-DD
+    end_date:   str  # YYYY-MM-DD (exclusive)
+
+
+@app.post("/maintenance-kpis", dependencies=[Security(verify_token)])
+def maintenance_kpis(req: MaintenanceKPIRequest):
+    try:
+        conn   = get_connection()
+        cursor = conn.cursor()
+        cursor.execute(f"""
+            SELECT
+                ROUND(SUM(CASE WHEN wl.Workcenter_Status_Key = 5448 THEN wl.Log_Hours ELSE 0 END), 2) AS Operating_Hours,
+                ROUND(SUM(CASE WHEN wl.Workcenter_Status_Key IN (5445, 5449) THEN wl.Log_Hours ELSE 0 END), 2) AS Downtime_Hours,
+                ROUND(SUM(CASE WHEN wl.Workcenter_Status_Key = 5445 THEN wl.Log_Hours ELSE 0 END), 2) AS Down_Hours,
+                ROUND(SUM(CASE WHEN wl.Workcenter_Status_Key = 5449 THEN wl.Log_Hours ELSE 0 END), 2) AS Setup_Hours,
+                ROUND(SUM(CASE WHEN wl.Workcenter_Status_Key = 5446 THEN wl.Log_Hours ELSE 0 END), 2) AS Idle_Hours,
+                SUM(CASE WHEN wl.Workcenter_Status_Key = 5445 THEN 1 ELSE 0 END) AS Total_Failures,
+                ROUND(
+                    SUM(CASE WHEN wl.Workcenter_Status_Key = 5445 THEN wl.Log_Hours ELSE 0 END) /
+                    NULLIF(SUM(CASE WHEN wl.Workcenter_Status_Key = 5445 THEN 1 ELSE 0 END), 0)
+                , 2) AS MTTR_Hours,
+                ROUND(
+                    SUM(CASE WHEN wl.Workcenter_Status_Key = 5448 THEN wl.Log_Hours ELSE 0 END) /
+                    NULLIF(SUM(CASE WHEN wl.Workcenter_Status_Key = 5445 THEN 1 ELSE 0 END), 0)
+                , 2) AS MTBF_Hours,
+                ROUND(
+                    SUM(CASE WHEN wl.Workcenter_Status_Key = 5448 THEN wl.Log_Hours ELSE 0 END) * 100.0 /
+                    NULLIF(
+                        SUM(CASE WHEN wl.Workcenter_Status_Key IN (5448, 5445, 5449) THEN wl.Log_Hours ELSE 0 END)
+                    , 0)
+                , 2) AS Availability_Pct
+            FROM Part_v_Workcenter_Log wl
+            WHERE wl.Plexus_Customer_No = {PCN}
+              AND wl.Log_Date >= '{req.start_date}'
+              AND wl.Log_Date <  '{req.end_date}'
+              AND wl.Log_Hours > 0
+        """)
+        row = cursor.fetchone()
+        conn.close()
+        if not row:
+            return {"data": None}
+        cols = [d[0] for d in cursor.description] if cursor.description else []
+        # cursor ya cerrado — reconstruir desde row directamente
+        keys = [
+            "operating_hours", "downtime_hours", "down_hours", "setup_hours",
+            "idle_hours", "total_failures", "mttr_hours", "mtbf_hours", "availability_pct"
+        ]
+        result = {}
+        for i, key in enumerate(keys):
+            val = row[i]
+            result[key] = float(val) if val is not None else None
+        return {"data": result}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ─── Downtime Reasons ─────────────────────────────────────────────────────────
+
+@app.post("/maintenance-downtime-reasons", dependencies=[Security(verify_token)])
+def maintenance_downtime_reasons(req: MaintenanceKPIRequest):
+    try:
+        conn   = get_connection()
+        cursor = conn.cursor()
+        cursor.execute(f"""
+            SELECT
+                ISNULL(we.Description, 'Sin Razón') AS Reason,
+                COUNT(*) AS Total_Events,
+                ROUND(SUM(wl.Log_Hours), 2) AS Total_Hours
+            FROM Part_v_Workcenter_Log wl
+            LEFT JOIN Part_v_Workcenter_Event we
+                ON wl.Workcenter_Event_Key = we.Workcenter_Event_Key
+                AND wl.Plexus_Customer_No = we.Plexus_Customer_No
+            WHERE wl.Plexus_Customer_No = {PCN}
+              AND wl.Log_Date >= '{req.start_date}'
+              AND wl.Log_Date <  '{req.end_date}'
+              AND wl.Workcenter_Status_Key IN (5445, 5449)
+              AND wl.Log_Hours > 0
+            GROUP BY we.Description
+            ORDER BY Total_Hours DESC
+        """)
+        rows = query_to_list(cursor)
+        conn.close()
+        grand_total = sum(float(r["Total_Hours"] or 0) for r in rows)
+        result = []
+        for r in rows:
+            hrs = float(r["Total_Hours"] or 0)
+            result.append({
+                "reason":       r["Reason"],
+                "total_events": int(r["Total_Events"] or 0),
+                "total_hours":  hrs,
+                "percentage":   round(hrs / grand_total * 100, 2) if grand_total > 0 else 0,
+            })
+        return {"data": result, "grand_total_hours": round(grand_total, 2)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ─── Downtime Reason Detail ───────────────────────────────────────────────────
+
+class MaintenanceDetailRequest(BaseModel):
+    start_date: str
+    end_date:   str
+    reason:     str
+
+
+@app.post("/maintenance-downtime-detail", dependencies=[Security(verify_token)])
+def maintenance_downtime_detail(req: MaintenanceDetailRequest):
+    try:
+        reason_filter = req.reason.replace("'", "''")
+        conn   = get_connection()
+        cursor = conn.cursor()
+        cursor.execute(f"""
+            SELECT
+                wl.Log_Date,
+                wl.Log_Hours,
+                ws.Description  AS Status,
+                ISNULL(we.Description, 'Sin Razón') AS Reason,
+                wl.Description  AS Notes,
+                wc.Name         AS Workcenter,
+                sh.Shift,
+                p.Part_No,
+                po.Operation_No,
+                po.Description  AS Operation_Description,
+                jo.Job_No
+            FROM Part_v_Workcenter_Log wl
+            LEFT JOIN Part_v_Workcenter_Status ws
+                ON wl.Workcenter_Status_Key = ws.Workcenter_Status_Key
+                AND wl.Plexus_Customer_No = ws.Plexus_Customer_No
+            LEFT JOIN Part_v_Workcenter_Event we
+                ON wl.Workcenter_Event_Key = we.Workcenter_Event_Key
+                AND wl.Plexus_Customer_No = we.Plexus_Customer_No
+            LEFT JOIN Part_v_Workcenter wc
+                ON wl.Workcenter_Key = wc.Workcenter_Key
+                AND wl.Plexus_Customer_No = wc.Plexus_Customer_No
+            LEFT JOIN Common_v_Shift sh
+                ON wl.Shift_Key = sh.Shift_Key
+                AND wl.Plexus_Customer_No = sh.Plexus_Customer_No
+            LEFT JOIN Part_v_Part_e p
+                ON wl.Part_Key = p.Part_Key
+                AND wl.Plexus_Customer_No = p.Plexus_Customer_No
+            LEFT JOIN Part_v_Part_Operation po
+                ON wl.Part_Operation_Key = po.Part_Operation_Key
+                AND wl.Plexus_Customer_No = po.Plexus_Customer_No
+            LEFT JOIN Part_v_Job_e jo
+                ON wl.Job_Op_Key = jo.Job_Key
+                AND wl.Plexus_Customer_No = jo.PCN
+            WHERE wl.Plexus_Customer_No = {PCN}
+              AND wl.Log_Date >= '{req.start_date}'
+              AND wl.Log_Date <  '{req.end_date}'
+              AND wl.Workcenter_Status_Key IN (5445, 5449)
+              AND wl.Log_Hours > 0
+              AND ISNULL(we.Description, 'Sin Razón') = '{reason_filter}'
+            ORDER BY wl.Log_Date
+        """)
+        data = query_to_list(cursor)
+        conn.close()
+        return {"data": data}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/maintenance-downtime-by-month", dependencies=[Security(verify_token)])
+def maintenance_downtime_by_month(req: MaintenanceKPIRequest):
+    try:
+        conn   = get_connection()
+        cursor = conn.cursor()
+        cursor.execute(f"""
+            SELECT
+                YEAR(wl.Log_Date)                           AS Year,
+                MONTH(wl.Log_Date)                          AS Month,
+                DAY(wl.Log_Date)                            AS Day,
+                ISNULL(we.Description, 'Sin Razon')         AS Reason,
+                COUNT(*)                                    AS Total_Events,
+                ROUND(SUM(wl.Log_Hours), 2)                 AS Total_Hours
+            FROM Part_v_Workcenter_Log wl
+            LEFT JOIN Part_v_Workcenter_Event we
+                ON wl.Workcenter_Event_Key = we.Workcenter_Event_Key
+                AND wl.Plexus_Customer_No  = we.Plexus_Customer_No
+            WHERE wl.Plexus_Customer_No = {PCN}
+              AND wl.Log_Date >= '{req.start_date}'
+              AND wl.Log_Date <  '{req.end_date}'
+              AND wl.Workcenter_Status_Key IN (5445, 5449)
+              AND wl.Log_Hours > 0
+            GROUP BY
+                YEAR(wl.Log_Date),
+                MONTH(wl.Log_Date),
+                DAY(wl.Log_Date),
+                we.Description
+            ORDER BY Year, Month, Day, Total_Hours DESC
+        """)
+        rows = query_to_list(cursor)
+        conn.close()
+
+        result = []
+        for r in rows:
+            year  = int(r["Year"]  or 0)
+            month = int(r["Month"] or 0)
+            day   = int(r["Day"]   or 0)
+            result.append({
+                "date":         f"{year:04d}-{month:02d}-{day:02d}",  # "2026-03-15"
+                "reason":       r["Reason"],
+                "total_events": int(r["Total_Events"]  or 0),
+                "total_hours":  float(r["Total_Hours"] or 0),
+            })
+        return {"data": result}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+class WorkRequestsRequest(BaseModel):
+    start_date: str  # YYYY-MM-DD
+    end_date:   str  # YYYY-MM-DD (inclusive)
+
+
+@app.post("/work-requests", dependencies=[Security(verify_token)])
+def work_requests(req: WorkRequestsRequest):
+    try:
+        conn   = get_connection()
+        cursor = conn.cursor()
+        cursor.execute(f"""
+            SELECT
+                wr.Work_Request_No,
+                wr.Description,
+                wr.Request_Date,
+                wr.Due_Date,
+                wr.Completed_Date,
+                ws.Work_Request_Status,
+                wt.Work_Request_Type,
+                u.First_Name + ' ' + u.Last_Name AS Assigned_To,
+                eq.Equipment_ID,
+                eq.Description  AS Equipment_Description,
+                eq.Equipment_Group,
+                d.Name          AS Department_Name,
+                CASE
+                    WHEN wr.Completed_Production_Hours > 0
+                        THEN wr.Completed_Production_Hours
+                    ELSE wr.Scheduled_Hours
+                END             AS Maintenance_Hours,
+                f.Failure,
+                ft.Failure_Type,
+                fa.Failure_Action
+            FROM Maintenance_v_Work_Request AS wr
+            LEFT JOIN Plexus_Control_v_Plexus_User_e AS u
+                ON wr.Assigned_To = u.Plexus_User_No
+            LEFT JOIN Maintenance_v_Work_Request_Status AS ws
+                ON wr.Work_Request_Status_Key = ws.Work_Request_Status_Key
+            LEFT JOIN Maintenance_v_Work_Request_Type AS wt
+                ON wr.Work_Request_Type_Key = wt.Work_Request_Type_Key
+            LEFT JOIN Maintenance_v_Work_Request_Failure AS wrf
+                ON wr.Work_Request_Key = wrf.Work_Request_Key
+            LEFT JOIN Maintenance_v_Failure AS f
+                ON wrf.Failure_Key = f.Failure_Key
+            LEFT JOIN Maintenance_v_Failure_Type AS ft
+                ON wrf.Failure_Type_Key = ft.Failure_Type_Key
+            LEFT JOIN Maintenance_v_Failure_Action AS fa
+                ON wrf.Failure_Action_Key = fa.Failure_Action_Key
+            LEFT JOIN Maintenance_v_Equipment AS eq
+                ON wr.Equipment_Key = eq.Equipment_Key
+            LEFT JOIN Part_v_Workcenter AS wc
+                ON wr.Workcenter_Key = wc.Workcenter_Key
+            LEFT JOIN Common_v_Department AS d
+                ON wc.Department_No = d.Department_No
+            WHERE wr.Plexus_Customer_No = {PCN}
+              AND CAST(wr.Request_Date AS DATE) >= '{req.start_date}'
+              AND CAST(wr.Request_Date AS DATE) <= '{req.end_date}'
+        """)
+        rows = query_to_list(cursor)
+        conn.close()
+
+        # Normalizar nulos y tipos
+        result = []
+        for r in rows:
+            result.append({
+                "work_request_no":       r["Work_Request_No"],
+                "description":           r["Description"] or "",
+                "request_date":          r["Request_Date"].isoformat() if hasattr(r["Request_Date"], "isoformat") else str(r["Request_Date"] or ""),
+                "due_date":              r["Due_Date"].isoformat() if hasattr(r["Due_Date"], "isoformat") else str(r["Due_Date"] or ""),
+                "completed_date":        r["Completed_Date"].isoformat() if r["Completed_Date"] and hasattr(r["Completed_Date"], "isoformat") else None,
+                "status":                r["Work_Request_Status"] or "Unknown",
+                "type":                  r["Work_Request_Type"]   or "Unknown",
+                "assigned_to":           r["Assigned_To"]         or "Unassigned",
+                "equipment_id":          r["Equipment_ID"]        or "",
+                "equipment_description": r["Equipment_Description"] or "",
+                "equipment_group":       r["Equipment_Group"]     or "Other",
+                "department":            r["Department_Name"]     or "Unknown",
+                "maintenance_hours":     float(r["Maintenance_Hours"] or 0),
+                "failure":               r["Failure"]             or "",
+                "failure_type":          r["Failure_Type"]        or "",
+                "failure_action":        r["Failure_Action"]      or "",
+            })
+        return {"data": result}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
