@@ -200,6 +200,7 @@ def bom_ctb(req: BomCtbRequest):
         conn = get_connection()
         cursor = conn.cursor()
 
+        # ── PASO 1: Parte raíz ───────────────────────────────────────────────
         cursor.execute(f"""
             SELECT Part_Key, Part_No, Revision, Name
             FROM Part_v_Part
@@ -212,11 +213,14 @@ def bom_ctb(req: BomCtbRequest):
             conn.close()
             return {"data": []}
 
-        root_key, root_no, root_rev, root_name = root_row[0], root_row[1], root_row[2], root_row[3]
+        root_key, root_no, root_rev, root_name = (
+            root_row[0], root_row[1], root_row[2], root_row[3]
+        )
         rows_collected = []
         seen_keys      = set()
         current_level  = [(root_key, root_no, root_rev, root_name, root_no, 1.0)]
 
+        # ── PASO 2: Recorrer BOM nivel a nivel ───────────────────────────────
         for level in range(1, req.max_levels + 1):
             if not current_level:
                 break
@@ -243,37 +247,42 @@ def bom_ctb(req: BomCtbRequest):
             next_level = []
 
             for cr in child_rows:
-                parent_key  = cr[0]
-                bom_qty     = float(cr[2]) if cr[2] is not None else 0.0
-                note        = cr[3] or ''
-                comp_key    = cr[4]
-                comp_no     = cr[5]
-                comp_rev    = cr[6]
-                comp_name   = cr[7]
-                comp_unit   = cr[8] or ''
+                parent_key      = cr[0]
+                bom_qty         = float(cr[2]) if cr[2] is not None else 0.0
+                note            = cr[3] or ''
+                comp_key        = cr[4]
+                comp_no         = cr[5]
+                comp_rev        = cr[6]
+                comp_name       = cr[7]
+                comp_unit       = cr[8] or ''
 
-                parent_info    = parent_map.get(parent_key)
-                parent_path    = parent_info[4] if parent_info else ''
-                parent_qty_acc = parent_info[5] if parent_info else 1.0
-                bom_path       = f"{parent_path} > {comp_no}"
+                parent_info     = parent_map.get(parent_key)
+                parent_path     = parent_info[4] if parent_info else ''
+                parent_qty_acc  = parent_info[5] if parent_info else 1.0
+                bom_path        = f"{parent_path} > {comp_no}"
                 qty_accumulated = bom_qty * parent_qty_acc
 
                 rows_collected.append({
-                    "_comp_key": comp_key,
-                    "_qty_acc":  qty_accumulated,
-                    "level":             level,
-                    "root_part_no_rev":  f"{root_no} Rev:{root_rev}",
-                    "part_no_rev":       f"{comp_no} Rev:{comp_rev}",
-                    "part_name":         comp_name,
-                    "bom_qty":           round(bom_qty, 6),
-                    "unit":              comp_unit,
-                    "note":              note,
-                    "bom_path":          bom_path,
+                    "_comp_key":  comp_key,
+                    "_comp_no":   comp_no,
+                    "_comp_rev":  comp_rev,
+                    "_qty_acc":   qty_accumulated,
+                    "level":            level,
+                    "root_part_no_rev": f"{root_no} Rev:{root_rev}",
+                    "part_no_rev":      f"{comp_no} Rev:{comp_rev}",
+                    "part_name":        comp_name,
+                    "bom_qty":          round(bom_qty, 6),
+                    "unit":             comp_unit,
+                    "note":             note,
+                    "bom_path":         bom_path,
                 })
 
                 if comp_key not in seen_keys:
                     seen_keys.add(comp_key)
-                    next_level.append((comp_key, comp_no, comp_rev, comp_name, bom_path, qty_accumulated))
+                    next_level.append((
+                        comp_key, comp_no, comp_rev, comp_name,
+                        bom_path, qty_accumulated
+                    ))
 
             current_level = next_level
 
@@ -281,16 +290,64 @@ def bom_ctb(req: BomCtbRequest):
             conn.close()
             return {"data": []}
 
-        # Inventario — una sola query para todos los componentes
-        all_comp_keys = list({row["_comp_key"] for row in rows_collected})
-        inv_in_clause = f"({', '.join(str(k) for k in all_comp_keys)})"
+        # ── PASO 2.5: Resolver revisión activa por Part_No ───────────────────
+        # Regla: usar la revisión con Part_Status = 'Active' de mayor número.
+        # Si un componente no tiene ninguna revisión Active → excluirlo.
+        all_comp_nos = list({row["_comp_no"] for row in rows_collected})
+        if len(all_comp_nos) == 1:
+            nos_in_clause = f"('{all_comp_nos[0]}')"
+        else:
+            nos_in_clause = "(" + ", ".join(f"'{n}'" for n in all_comp_nos) + ")"
+
+        cursor.execute(f"""
+            SELECT Part_No, Revision, Part_Key
+            FROM Part_v_Part
+            WHERE Plexus_Customer_No = {PCN}
+              AND Part_No IN {nos_in_clause}
+              AND Part_Status = 'Active'
+        """)
+        rev_rows = cursor.fetchall()
+
+        # Mapa part_no → (revision_activa_mas_alta, part_key)
+        active_rev_map: dict = {}
+        for rr in rev_rows:
+            pno, rev, pkey = rr[0], rr[1], rr[2]
+            if pno not in active_rev_map or str(rev) > str(active_rev_map[pno][0]):
+                active_rev_map[pno] = (rev, pkey)
+
+        # Excluir componentes sin revisión activa
+        rows_collected = [
+            row for row in rows_collected
+            if row["_comp_no"] in active_rev_map
+        ]
+
+        if not rows_collected:
+            conn.close()
+            return {"data": []}
+
+        # Anotar revisión activa en cada fila
+        for row in rows_collected:
+            comp_no    = row["_comp_no"]
+            bom_rev    = row["_comp_rev"]
+            chosen_rev, chosen_key = active_rev_map[comp_no]
+            row["_inv_key"]          = chosen_key
+            row["active_revision"]   = chosen_rev
+            row["is_latest_revision"] = (str(bom_rev) == str(chosen_rev))
+
+        # ── PASO 3: Inventario con revisión activa ───────────────────────────
+        # WH  = locaciones TJR o TJ WH
+        # WIP = todo lo que NO sea WH
+        all_inv_keys  = list({row["_inv_key"] for row in rows_collected})
+        inv_in_clause = f"({', '.join(str(k) for k in all_inv_keys)})"
 
         cursor.execute(f"""
             SELECT c.Part_Key,
                    SUM(c.Quantity) AS Total_Qty,
-                   SUM(CASE WHEN c.Location NOT LIKE '%TJR%' OR c.Location IS NULL
+                   SUM(CASE WHEN (c.Location NOT LIKE '%TJR%' AND c.Location NOT LIKE '%TJ WH%')
+                                  OR c.Location IS NULL
                             THEN c.Quantity ELSE 0 END) AS WIP,
                    SUM(CASE WHEN c.Location LIKE '%TJR%'
+                              OR c.Location LIKE '%TJ WH%'
                             THEN c.Quantity ELSE 0 END) AS INV
             FROM Part_v_Container c
             WHERE c.Plexus_Customer_No = {PCN}
@@ -302,7 +359,7 @@ def bom_ctb(req: BomCtbRequest):
         inv_rows = cursor.fetchall()
         conn.close()
 
-        inv_map = {}
+        inv_map: dict = {}
         for ir in inv_rows:
             inv_map[ir[0]] = {
                 "total": float(ir[1]) if ir[1] else 0.0,
@@ -310,32 +367,37 @@ def bom_ctb(req: BomCtbRequest):
                 "inv":   float(ir[3]) if ir[3] else 0.0,
             }
 
+        # ── PASO 4: Ensamblar respuesta final ────────────────────────────────
         final_rows = []
         for row in rows_collected:
-            comp_key  = row["_comp_key"]
-            qty_acc   = row["_qty_acc"]
-            inv       = inv_map.get(comp_key, {"total": 0.0, "wip": 0.0, "inv": 0.0})
-            ohymv     = round(qty_acc * req.need, 2)
-            ohnv      = inv["total"]
-            note_low  = (row.get("note") or "").lower()
+            inv_key  = row["_inv_key"]
+            qty_acc  = row["_qty_acc"]
+            inv      = inv_map.get(inv_key, {"total": 0.0, "wip": 0.0, "inv": 0.0})
+            ohymv    = round(qty_acc * req.need, 2)
+            ohnv     = inv["total"]
+
+            note_low   = (row.get("note") or "").lower()
             is_virtual = "phantom" in note_low or "embedded" in note_low
-            ctb       = "Yes" if (is_virtual or ohnv >= ohymv) else "No"
+            # CTB se basa en WH (inv), no en OH total
+            ctb = "Yes" if (is_virtual or inv["inv"] >= ohymv) else "No"
 
             final_rows.append({
-                "level":           row["level"],
-                "root_part_no_rev": row["root_part_no_rev"],
-                "part_no_rev":     row["part_no_rev"],
-                "part_name":       row["part_name"],
-                "bom_qty":         row["bom_qty"],
-                "unit":            row["unit"],
-                "need":            req.need,
-                "ohymv":           ohymv,
-                "wip":             round(inv["wip"], 2),
-                "inv":             round(inv["inv"], 2),
-                "ohnv":            round(ohnv, 2),
-                "ctb":             ctb,
-                "bom_path":        row["bom_path"],
-                "note":            row["note"],
+                "level":             row["level"],
+                "root_part_no_rev":  row["root_part_no_rev"],
+                "part_no_rev":       row["part_no_rev"],
+                "part_name":         row["part_name"],
+                "bom_qty":           row["bom_qty"],
+                "unit":              row["unit"],
+                "need":              req.need,
+                "ohymv":             ohymv,
+                "wip":               round(inv["wip"], 2),
+                "inv":               round(inv["inv"], 2),
+                "ohnv":              round(ohnv, 2),
+                "ctb":               ctb,
+                "bom_path":          row["bom_path"],
+                "note":              row["note"],
+                "is_latest_revision": row["is_latest_revision"],
+                "active_revision":   row["active_revision"],
             })
 
         final_rows.sort(key=lambda x: x["bom_path"])
@@ -343,7 +405,6 @@ def bom_ctb(req: BomCtbRequest):
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
 
 # ─── Demand ───────────────────────────────────────────────────────────────────
 
