@@ -1399,8 +1399,23 @@ class ScrapDetailRequest(BaseModel):
     use_shift:  bool = True
 
 
+# ─── Shift range helper ───────────────────────────────────────────────────────
+
 def get_shift_ab(scrap_date) -> str:
-    hour = scrap_date.hour if hasattr(scrap_date, 'hour') else 0
+    """
+    Turno A: 6AM-6PM local = 09:00-21:00 en servidor (UTC+3).
+    Turno B: 6PM-6AM local = 21:00-09:00 en servidor.
+    scrap_date puede llegar como datetime o como string ISO.
+    """
+    from datetime import datetime as dt
+    if scrap_date is None:
+        return "B"
+    if isinstance(scrap_date, str):
+        try:
+            scrap_date = dt.fromisoformat(scrap_date)
+        except ValueError:
+            return "B"
+    hour = scrap_date.hour
     return "A" if 9 <= hour < 21 else "B"
 
 
@@ -1430,6 +1445,7 @@ def scrap_detail(req: ScrapDetailRequest):
             SELECT
                 wc.Name                         AS Workcenter,
                 p.Part_No,
+                p.Part_Type,
                 s.Scrap_Reason,
                 s.Scrap_Date,
                 SUM(s.Quantity)                 AS Scrap_Qty,
@@ -1445,7 +1461,7 @@ def scrap_detail(req: ScrapDetailRequest):
               AND {date_col} >= '{start_str}'
               AND {date_col} <  '{end_str}'
               AND s.Quantity > 0
-            GROUP BY wc.Name, p.Part_No, s.Scrap_Reason, s.Scrap_Date
+            GROUP BY wc.Name, p.Part_No, p.Part_Type, s.Scrap_Reason, s.Scrap_Date
             ORDER BY Scrap_Qty DESC
         """)
         scrap_rows = query_to_list(cursor)
@@ -1487,7 +1503,7 @@ def scrap_detail(req: ScrapDetailRequest):
             cost       = float(r["Scrap_Cost"] or 0)
             bu         = get_bu(wc, part_no)
             scrap_date = r["Scrap_Date"]
-            shift      = get_shift_ab(scrap_date) if scrap_date else "A"
+            shift      = get_shift_ab(scrap_date) if scrap_date else "B"
 
             if wc not in wc_map:
                 wc_map[wc] = {
@@ -1507,8 +1523,8 @@ def scrap_detail(req: ScrapDetailRequest):
             total     = prod + scrap_qty
             yield_pct = round(prod / total * 100, 2) if total > 0 else 100.0
 
-            sa_qty = d["shift_a"]["scrap_qty"]
-            sb_qty = d["shift_b"]["scrap_qty"]
+            sa_qty  = d["shift_a"]["scrap_qty"]
+            sb_qty  = d["shift_b"]["scrap_qty"]
             sa_prod = prod * 0.5
             sb_prod = prod * 0.5
 
@@ -1555,16 +1571,20 @@ def scrap_detail(req: ScrapDetailRequest):
         # ── by_part ───────────────────────────────────────────────────────
         part_map: dict = {}
         for r in scrap_rows:
-            wc      = r["Workcenter"]
-            part_no = str(r["Part_No"] or "").strip().split(".")[0]
-            qty     = float(r["Scrap_Qty"]  or 0)
-            cost    = float(r["Scrap_Cost"] or 0)
-            key     = f"{part_no}|{wc}"
+            wc        = r["Workcenter"]
+            part_no   = str(r["Part_No"]   or "").strip().split(".")[0]
+            part_type = str(r["Part_Type"] or "").strip()
+            qty       = float(r["Scrap_Qty"]  or 0)
+            cost      = float(r["Scrap_Cost"] or 0)
+            key       = f"{part_no}|{wc}"
             if key not in part_map:
                 part_map[key] = {
-                    "part_no": part_no, "workcenter": wc,
-                    "bu": get_bu(wc, part_no),
-                    "scrap_qty": 0.0, "scrap_cost": 0.0,
+                    "part_no":    part_no,
+                    "part_type":  part_type,
+                    "workcenter": wc,
+                    "bu":         get_bu(wc, part_no),
+                    "scrap_qty":  0.0,
+                    "scrap_cost": 0.0,
                 }
             part_map[key]["scrap_qty"]  += qty
             part_map[key]["scrap_cost"] += cost
@@ -1580,7 +1600,7 @@ def scrap_detail(req: ScrapDetailRequest):
             wc         = r["Workcenter"]
             qty        = float(r["Scrap_Qty"] or 0)
             scrap_date = r["Scrap_Date"]
-            shift      = get_shift_ab(scrap_date) if scrap_date else "A"
+            shift      = get_shift_ab(scrap_date) if scrap_date else "B"
             key        = f"{wc}|{shift}"
             heatmap_map[key] = heatmap_map.get(key, 0.0) + qty
 
@@ -1590,6 +1610,7 @@ def scrap_detail(req: ScrapDetailRequest):
         ]
 
         # ── trend diaria ──────────────────────────────────────────────────
+        # ── trend diaria ──────────────────────────────────────────────────────────
         trend_map: dict = {}
         for r in scrap_rows:
             scrap_date = r["Scrap_Date"]
@@ -1607,20 +1628,75 @@ def scrap_detail(req: ScrapDetailRequest):
             cost    = float(r["Scrap_Cost"] or 0)
 
             if day_str not in trend_map:
-                trend_map[day_str] = {"date": day_str, "volvo_qty": 0.0, "cummins_qty": 0.0, "tulc_qty": 0.0, "total_cost": 0.0}
+                trend_map[day_str] = {
+                    "date": day_str,
+                    "volvo_qty": 0.0, "cummins_qty": 0.0, "tulc_qty": 0.0,
+                    "total_cost": 0.0, "scrap_qty": 0.0,
+                }
             trend_map[day_str][f"{bu}_qty"] += qty
             trend_map[day_str]["total_cost"] += cost
+            trend_map[day_str]["scrap_qty"]  += qty
+
+        # Agregar producción por día para calcular yield
+        for day_str, entry in trend_map.items():
+            prod_day = 0.0
+            for wc, prod_qty in prod_map.items():
+                # prod_map es total del período — necesitamos por día
+                pass
+
+        # Query producción por día
+        if req.use_shift:
+            from datetime import datetime as _dt, timedelta as _td
+            start_day = _dt.strptime(req.start_date, "%Y-%m-%d")
+            end_day   = _dt.strptime(req.end_date,   "%Y-%m-%d")
+        else:
+            from datetime import datetime as _dt
+            start_day = _dt.strptime(req.start_date, "%Y-%m-%d")
+            end_day   = _dt.strptime(req.end_date,   "%Y-%m-%d")
+
+        conn2   = get_connection()
+        cursor2 = conn2.cursor()
+        cursor2.execute(f"""
+            SELECT
+                CAST(pe.Record_Date AS DATE) AS Prod_Day,
+                SUM(pe.Quantity)             AS Quantity
+            FROM Part_v_Production_e pe
+            INNER JOIN Part_v_Workcenter wc
+                ON pe.Workcenter_Key      = wc.Workcenter_Key
+                AND pe.Plexus_Customer_No = wc.Plexus_Customer_No
+            WHERE pe.Plexus_Customer_No = {PCN}
+              AND {prod_col} >= '{start_str}'
+              AND {prod_col} <  '{end_str}'
+            GROUP BY CAST(pe.Record_Date AS DATE)
+        """)
+        prod_by_day_rows = query_to_list(cursor2)
+        conn2.close()
+
+        prod_by_day: dict = {}
+        for r in prod_by_day_rows:
+            day = str(r["Prod_Day"])[:10]
+            prod_by_day[day] = float(r["Quantity"] or 0)
 
         trend = []
         for d in sorted(trend_map.values(), key=lambda x: x["date"]):
-            total_qty = d["volvo_qty"] + d["cummins_qty"] + d["tulc_qty"]
+            day_str       = d["date"]
+            scrap_qty     = d["scrap_qty"]
+            prod_qty      = prod_by_day.get(day_str, 0.0)
+            total_qty_day = prod_qty + scrap_qty
+            yield_pct_day = round(prod_qty / total_qty_day * 100, 2) if total_qty_day > 0 else 100.0
+            volvo_qty     = d["volvo_qty"]
+            cummins_qty   = d["cummins_qty"]
+            tulc_qty      = d["tulc_qty"]
+
             trend.append({
-                "date":        d["date"],
-                "volvo_qty":   int(d["volvo_qty"]),
-                "cummins_qty": int(d["cummins_qty"]),
-                "tulc_qty":    int(d["tulc_qty"]),
-                "total_qty":   int(total_qty),
-                "total_cost":  round(d["total_cost"], 2),
+                "date":         day_str,
+                "volvo_qty":    int(volvo_qty),
+                "cummins_qty":  int(cummins_qty),
+                "tulc_qty":     int(tulc_qty),
+                "total_qty":    int(scrap_qty),
+                "total_cost":   round(d["total_cost"], 2),
+                "production":   int(prod_qty),
+                "yield_pct":    yield_pct_day,
             })
 
         # ── summary ───────────────────────────────────────────────────────
