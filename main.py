@@ -200,6 +200,7 @@ def bom_ctb(req: BomCtbRequest):
         conn = get_connection()
         cursor = conn.cursor()
 
+        # ── PASO 1: Parte raíz ───────────────────────────────────────────────
         cursor.execute(f"""
             SELECT Part_Key, Part_No, Revision, Name
             FROM Part_v_Part
@@ -212,11 +213,14 @@ def bom_ctb(req: BomCtbRequest):
             conn.close()
             return {"data": []}
 
-        root_key, root_no, root_rev, root_name = root_row[0], root_row[1], root_row[2], root_row[3]
+        root_key, root_no, root_rev, root_name = (
+            root_row[0], root_row[1], root_row[2], root_row[3]
+        )
         rows_collected = []
         seen_keys      = set()
         current_level  = [(root_key, root_no, root_rev, root_name, root_no, 1.0)]
 
+        # ── PASO 2: Recorrer BOM nivel a nivel ───────────────────────────────
         for level in range(1, req.max_levels + 1):
             if not current_level:
                 break
@@ -243,37 +247,42 @@ def bom_ctb(req: BomCtbRequest):
             next_level = []
 
             for cr in child_rows:
-                parent_key  = cr[0]
-                bom_qty     = float(cr[2]) if cr[2] is not None else 0.0
-                note        = cr[3] or ''
-                comp_key    = cr[4]
-                comp_no     = cr[5]
-                comp_rev    = cr[6]
-                comp_name   = cr[7]
-                comp_unit   = cr[8] or ''
+                parent_key      = cr[0]
+                bom_qty         = float(cr[2]) if cr[2] is not None else 0.0
+                note            = cr[3] or ''
+                comp_key        = cr[4]
+                comp_no         = cr[5]
+                comp_rev        = cr[6]
+                comp_name       = cr[7]
+                comp_unit       = cr[8] or ''
 
-                parent_info    = parent_map.get(parent_key)
-                parent_path    = parent_info[4] if parent_info else ''
-                parent_qty_acc = parent_info[5] if parent_info else 1.0
-                bom_path       = f"{parent_path} > {comp_no}"
+                parent_info     = parent_map.get(parent_key)
+                parent_path     = parent_info[4] if parent_info else ''
+                parent_qty_acc  = parent_info[5] if parent_info else 1.0
+                bom_path        = f"{parent_path} > {comp_no}"
                 qty_accumulated = bom_qty * parent_qty_acc
 
                 rows_collected.append({
-                    "_comp_key": comp_key,
-                    "_qty_acc":  qty_accumulated,
-                    "level":             level,
-                    "root_part_no_rev":  f"{root_no} Rev:{root_rev}",
-                    "part_no_rev":       f"{comp_no} Rev:{comp_rev}",
-                    "part_name":         comp_name,
-                    "bom_qty":           round(bom_qty, 6),
-                    "unit":              comp_unit,
-                    "note":              note,
-                    "bom_path":          bom_path,
+                    "_comp_key":  comp_key,
+                    "_comp_no":   comp_no,
+                    "_comp_rev":  comp_rev,
+                    "_qty_acc":   qty_accumulated,
+                    "level":            level,
+                    "root_part_no_rev": f"{root_no} Rev:{root_rev}",
+                    "part_no_rev":      f"{comp_no} Rev:{comp_rev}",
+                    "part_name":        comp_name,
+                    "bom_qty":          round(bom_qty, 6),
+                    "unit":             comp_unit,
+                    "note":             note,
+                    "bom_path":         bom_path,
                 })
 
                 if comp_key not in seen_keys:
                     seen_keys.add(comp_key)
-                    next_level.append((comp_key, comp_no, comp_rev, comp_name, bom_path, qty_accumulated))
+                    next_level.append((
+                        comp_key, comp_no, comp_rev, comp_name,
+                        bom_path, qty_accumulated
+                    ))
 
             current_level = next_level
 
@@ -281,16 +290,64 @@ def bom_ctb(req: BomCtbRequest):
             conn.close()
             return {"data": []}
 
-        # Inventario — una sola query para todos los componentes
-        all_comp_keys = list({row["_comp_key"] for row in rows_collected})
-        inv_in_clause = f"({', '.join(str(k) for k in all_comp_keys)})"
+        # ── PASO 2.5: Resolver revisión activa por Part_No ───────────────────
+        # Regla: usar la revisión con Part_Status = 'Active' de mayor número.
+        # Si un componente no tiene ninguna revisión Active → excluirlo.
+        all_comp_nos = list({row["_comp_no"] for row in rows_collected})
+        if len(all_comp_nos) == 1:
+            nos_in_clause = f"('{all_comp_nos[0]}')"
+        else:
+            nos_in_clause = "(" + ", ".join(f"'{n}'" for n in all_comp_nos) + ")"
+
+        cursor.execute(f"""
+            SELECT Part_No, Revision, Part_Key
+            FROM Part_v_Part
+            WHERE Plexus_Customer_No = {PCN}
+              AND Part_No IN {nos_in_clause}
+              AND Part_Status = 'Active'
+        """)
+        rev_rows = cursor.fetchall()
+
+        # Mapa part_no → (revision_activa_mas_alta, part_key)
+        active_rev_map: dict = {}
+        for rr in rev_rows:
+            pno, rev, pkey = rr[0], rr[1], rr[2]
+            if pno not in active_rev_map or str(rev) > str(active_rev_map[pno][0]):
+                active_rev_map[pno] = (rev, pkey)
+
+        # Excluir componentes sin revisión activa
+        rows_collected = [
+            row for row in rows_collected
+            if row["_comp_no"] in active_rev_map
+        ]
+
+        if not rows_collected:
+            conn.close()
+            return {"data": []}
+
+        # Anotar revisión activa en cada fila
+        for row in rows_collected:
+            comp_no    = row["_comp_no"]
+            bom_rev    = row["_comp_rev"]
+            chosen_rev, chosen_key = active_rev_map[comp_no]
+            row["_inv_key"]          = chosen_key
+            row["active_revision"]   = chosen_rev
+            row["is_latest_revision"] = (str(bom_rev) == str(chosen_rev))
+
+        # ── PASO 3: Inventario con revisión activa ───────────────────────────
+        # WH  = locaciones TJR o TJ WH
+        # WIP = todo lo que NO sea WH
+        all_inv_keys  = list({row["_inv_key"] for row in rows_collected})
+        inv_in_clause = f"({', '.join(str(k) for k in all_inv_keys)})"
 
         cursor.execute(f"""
             SELECT c.Part_Key,
                    SUM(c.Quantity) AS Total_Qty,
-                   SUM(CASE WHEN c.Location NOT LIKE '%TJR%' OR c.Location IS NULL
+                   SUM(CASE WHEN (c.Location NOT LIKE '%TJR%' AND c.Location NOT LIKE '%TJ WH%')
+                                  OR c.Location IS NULL
                             THEN c.Quantity ELSE 0 END) AS WIP,
                    SUM(CASE WHEN c.Location LIKE '%TJR%'
+                              OR c.Location LIKE '%TJ WH%'
                             THEN c.Quantity ELSE 0 END) AS INV
             FROM Part_v_Container c
             WHERE c.Plexus_Customer_No = {PCN}
@@ -302,7 +359,7 @@ def bom_ctb(req: BomCtbRequest):
         inv_rows = cursor.fetchall()
         conn.close()
 
-        inv_map = {}
+        inv_map: dict = {}
         for ir in inv_rows:
             inv_map[ir[0]] = {
                 "total": float(ir[1]) if ir[1] else 0.0,
@@ -310,32 +367,37 @@ def bom_ctb(req: BomCtbRequest):
                 "inv":   float(ir[3]) if ir[3] else 0.0,
             }
 
+        # ── PASO 4: Ensamblar respuesta final ────────────────────────────────
         final_rows = []
         for row in rows_collected:
-            comp_key  = row["_comp_key"]
-            qty_acc   = row["_qty_acc"]
-            inv       = inv_map.get(comp_key, {"total": 0.0, "wip": 0.0, "inv": 0.0})
-            ohymv     = round(qty_acc * req.need, 2)
-            ohnv      = inv["total"]
-            note_low  = (row.get("note") or "").lower()
+            inv_key  = row["_inv_key"]
+            qty_acc  = row["_qty_acc"]
+            inv      = inv_map.get(inv_key, {"total": 0.0, "wip": 0.0, "inv": 0.0})
+            ohymv    = round(qty_acc * req.need, 2)
+            ohnv     = inv["total"]
+
+            note_low   = (row.get("note") or "").lower()
             is_virtual = "phantom" in note_low or "embedded" in note_low
-            ctb       = "Yes" if (is_virtual or ohnv >= ohymv) else "No"
+            # CTB se basa en WH (inv), no en OH total
+            ctb = "Yes" if (is_virtual or inv["inv"] >= ohymv) else "No"
 
             final_rows.append({
-                "level":           row["level"],
-                "root_part_no_rev": row["root_part_no_rev"],
-                "part_no_rev":     row["part_no_rev"],
-                "part_name":       row["part_name"],
-                "bom_qty":         row["bom_qty"],
-                "unit":            row["unit"],
-                "need":            req.need,
-                "ohymv":           ohymv,
-                "wip":             round(inv["wip"], 2),
-                "inv":             round(inv["inv"], 2),
-                "ohnv":            round(ohnv, 2),
-                "ctb":             ctb,
-                "bom_path":        row["bom_path"],
-                "note":            row["note"],
+                "level":             row["level"],
+                "root_part_no_rev":  row["root_part_no_rev"],
+                "part_no_rev":       row["part_no_rev"],
+                "part_name":         row["part_name"],
+                "bom_qty":           row["bom_qty"],
+                "unit":              row["unit"],
+                "need":              req.need,
+                "ohymv":             ohymv,
+                "wip":               round(inv["wip"], 2),
+                "inv":               round(inv["inv"], 2),
+                "ohnv":              round(ohnv, 2),
+                "ctb":               ctb,
+                "bom_path":          row["bom_path"],
+                "note":              row["note"],
+                "is_latest_revision": row["is_latest_revision"],
+                "active_revision":   row["active_revision"],
             })
 
         final_rows.sort(key=lambda x: x["bom_path"])
@@ -343,7 +405,6 @@ def bom_ctb(req: BomCtbRequest):
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
 
 # ─── Demand ───────────────────────────────────────────────────────────────────
 
@@ -1123,12 +1184,10 @@ def work_requests(req: WorkRequestsRequest):
                 eq.Equipment_ID,
                 eq.Description  AS Equipment_Description,
                 eq.Equipment_Group,
+                wc.Name         AS Workcenter,
                 d.Name          AS Department_Name,
-                CASE
-                    WHEN wr.Completed_Production_Hours > 0
-                        THEN wr.Completed_Production_Hours
-                    ELSE wr.Scheduled_Hours
-                END             AS Maintenance_Hours,
+                ROUND(ISNULL(wr.Scheduled_Hours, 0), 2)  AS Scheduled_Hours,
+                ROUND(ISNULL(el.Duration, 0), 2)         AS Maintenance_Hours,
                 f.Failure,
                 ft.Failure_Type,
                 fa.Failure_Action
@@ -1153,14 +1212,19 @@ def work_requests(req: WorkRequestsRequest):
                 ON wr.Workcenter_Key = wc.Workcenter_Key
             LEFT JOIN Common_v_Department AS d
                 ON wc.Department_No = d.Department_No
+            LEFT JOIN (
+                SELECT el.Work_Request_Key, SUM(el.Duration) AS Duration
+                FROM Maintenance_v_Equipment_Log el
+                GROUP BY el.Work_Request_Key
+            ) AS el
+                ON wr.Work_Request_Key = el.Work_Request_Key
             WHERE wr.Plexus_Customer_No = {PCN}
-              AND CAST(wr.Request_Date AS DATE) >= '{req.start_date}'
-              AND CAST(wr.Request_Date AS DATE) <= '{req.end_date}'
+              AND wr.Request_Date >= '{req.start_date}'
+              AND wr.Request_Date <= '{req.end_date}'
         """)
         rows = query_to_list(cursor)
         conn.close()
 
-        # Normalizar nulos y tipos
         result = []
         for r in rows:
             result.append({
@@ -1175,12 +1239,488 @@ def work_requests(req: WorkRequestsRequest):
                 "equipment_id":          r["Equipment_ID"]        or "",
                 "equipment_description": r["Equipment_Description"] or "",
                 "equipment_group":       r["Equipment_Group"]     or "Other",
+                "workcenter":            r["Workcenter"]          or "",
                 "department":            r["Department_Name"]     or "Unknown",
+                "scheduled_hours":       float(r["Scheduled_Hours"]   or 0),
                 "maintenance_hours":     float(r["Maintenance_Hours"] or 0),
                 "failure":               r["Failure"]             or "",
                 "failure_type":          r["Failure_Type"]        or "",
                 "failure_action":        r["Failure_Action"]      or "",
             })
         return {"data": result}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class OEERequest(BaseModel):
+    start_date: str
+    end_date: str
+
+@app.post("/oee-live")
+def oee_live(req: OEERequest):
+    try:
+        with get_connection() as conn:
+            cursor = conn.cursor()
+
+            # ── 1. Availability POR WORKCENTER ───────────────────────────────
+            cursor.execute(f"""
+                SELECT
+                    wc.Name AS Workcenter,
+                    SUM(CASE WHEN wl.Workcenter_Status_Key = 5448 THEN wl.Log_Hours ELSE 0 END) AS Operating_Hours,
+                    SUM(CASE WHEN wl.Workcenter_Status_Key IN (5448,5445,5449) THEN wl.Log_Hours ELSE 0 END) AS Plan_Hours
+                FROM Part_v_Workcenter_Log AS wl
+                INNER JOIN Part_v_Workcenter AS wc
+                    ON wl.Workcenter_Key = wc.Workcenter_Key AND wl.Plexus_Customer_No = wc.Plexus_Customer_No
+                WHERE wl.Plexus_Customer_No = 306713
+                  AND wl.Log_Hours > 0
+                  AND CAST(wl.Log_Date AS DATE) >= '{req.start_date}'
+                  AND CAST(wl.Log_Date AS DATE) <= '{req.end_date}'
+                GROUP BY wc.Name
+            """)
+            availability = {r[0]: {"operating": float(r[1] or 0), "plan": float(r[2] or 0)}
+                            for r in cursor.fetchall()}
+
+            # ── 2. Production por WC ─────────────────────────────────────────
+            cursor.execute(f"""
+                SELECT wc.Name, SUM(pe.Quantity)
+                FROM Part_v_Production_e AS pe
+                INNER JOIN Part_v_Workcenter AS wc
+                    ON pe.Workcenter_Key = wc.Workcenter_Key AND pe.Plexus_Customer_No = wc.Plexus_Customer_No
+                WHERE pe.Plexus_Customer_No = 306713
+                  AND CAST(pe.Report_Date AS DATE) >= '{req.start_date}'
+                  AND CAST(pe.Report_Date AS DATE) <= '{req.end_date}'
+                GROUP BY wc.Name
+            """)
+            production = {r[0]: float(r[1] or 0) for r in cursor.fetchall()}
+
+            # ── 3. Scrap por WC ──────────────────────────────────────────────
+            cursor.execute(f"""
+                SELECT wc.Name, SUM(s.Quantity)
+                FROM Part_v_Scrap AS s
+                INNER JOIN Part_v_Workcenter AS wc
+                    ON s.Workcenter_Key = wc.Workcenter_Key AND s.Plexus_Customer_No = wc.Plexus_Customer_No
+                INNER JOIN Part_v_Part AS pt
+                    ON s.Part_Key = pt.Part_Key AND s.Plexus_Customer_No = pt.Plexus_Customer_No
+                WHERE s.Plexus_Customer_No = 306713
+                  AND CAST(s.Scrap_Date AS DATE) >= '{req.start_date}'
+                  AND CAST(s.Scrap_Date AS DATE) <= '{req.end_date}'
+                  AND pt.Part_No LIKE '%.2'
+                GROUP BY wc.Name
+            """)
+            scrap = {r[0]: float(r[1] or 0) for r in cursor.fetchall()}
+
+        IDEAL_RATES = {
+            'HM Auto Siphon / Return Tube Bend':       60.0,
+            'HM Doblado de Siphon':                    60.0,
+            'HM Doblado Manual para Tubo de Retorno':  180.0,
+            'HM Dobladora Unison':                     60.0,
+            'HM Empaque':                              79.0,
+            'HM Ensamble Bobina':                      72.0,
+            'HM Ensamble de Servicio':                 35.0,
+            'HM Ensamble Final':                       50.0,
+            'HM Ensamble Final 2':                     50.0,
+            'HM Ensamble Final 3':                     50.0,
+            'HM Ensamble Frontal':                     50.0,
+            'HM Ensamble Frontal 2':                   50.0,
+            'HM Ensamble Frontal 3':                   50.0,
+            'HM Lavado':                               120.0,
+            'HM O-Ring':                               120.0,
+            'HM Prensa para Muesca':                   240.0,
+            'HM Proto 1':                              180.0,
+            'HM Soldadura de Siphon':                  60.0,
+            'HM Weld':                                 60.0,
+            'TULC Doblado de PZT':                     0.0,
+            'TULC Encapsulado Final':                  0.0,
+            'TULC Ensamble de Cable':                  0.0,
+            'TULC Ensamble de Sensor':                 110.0,
+            'TULC Ensamble Final':                     79.0,
+            'TULC Perforación Final':                  150.0,
+            'TULC Soldadura de Sensores':              138.0,
+            'Velocidad Corte y Formado de IC':         164.0,
+            'Velocidad Ensamble de Copa':              180.0,
+            'Velocidad Ensamble de Transportador':     225.0,
+            'Velocidad Moldeo AS1':                    168.0,
+            'Velocidad Prueba Final':                  225.0,
+            'Velocidad QC Inspección':                 225.0,
+        }
+
+        # Número de días del rango para normalizar ideal_output
+        from datetime import date as dt
+        d0   = dt.fromisoformat(req.start_date)
+        d1   = dt.fromisoformat(req.end_date)
+        days = max((d1 - d0).days + 1, 1)
+
+        total_good         = 0.0
+        total_qty          = 0.0
+        total_ideal_output = 0.0
+        total_operating    = 0.0
+        total_plan         = 0.0
+
+        all_wc = set(availability.keys()) | set(production.keys()) | set(scrap.keys())
+        for wc in all_wc:
+            ideal_rate = IDEAL_RATES.get(wc, 0.0)
+            av         = availability.get(wc, {"operating": 0.0, "plan": 0.0})
+            op_hrs     = av["operating"]
+            plan_hrs   = av["plan"]
+            good       = production.get(wc, 0.0)
+            scrap_qty  = scrap.get(wc, 0.0)
+            total      = good + scrap_qty
+
+            total_operating += op_hrs
+            total_plan      += plan_hrs
+            total_good      += good
+            total_qty       += total
+
+            if ideal_rate > 0 and op_hrs > 0:
+                total_ideal_output += op_hrs * ideal_rate
+
+        availability_pct = min((total_operating / total_plan * 100), 100.0)  if total_plan      > 0 else 0.0
+        performance_pct  = min((total_qty / total_ideal_output * 100), 100.0) if total_ideal_output > 0 else 0.0
+        quality_pct      = min((total_good / total_qty * 100), 100.0)         if total_qty       > 0 else 0.0
+        oee_pct          = (availability_pct / 100) * (performance_pct / 100) * (quality_pct / 100) * 100
+
+        return {
+            "data": {
+                "availability_pct": round(availability_pct, 2),
+                "performance_pct":  round(performance_pct, 2),
+                "quality_pct":      round(quality_pct, 2),
+                "oee_pct":          round(oee_pct, 2),
+            }
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ─── Scrap Detail (Quality Dashboard) ────────────────────────────────────────
+
+class ScrapDetailRequest(BaseModel):
+    start_date: str
+    end_date:   str
+    use_shift:  bool = True
+
+
+# ─── Shift range helper ───────────────────────────────────────────────────────
+
+def get_shift_ab(scrap_date) -> str:
+    """
+    Turno A: 6AM-6PM local = 09:00-21:00 en servidor (UTC+3).
+    Turno B: 6PM-6AM local = 21:00-09:00 en servidor.
+    scrap_date puede llegar como datetime o como string ISO.
+    """
+    from datetime import datetime as dt
+    if scrap_date is None:
+        return "B"
+    if isinstance(scrap_date, str):
+        try:
+            scrap_date = dt.fromisoformat(scrap_date)
+        except ValueError:
+            return "B"
+    hour = scrap_date.hour
+    return "A" if 9 <= hour < 21 else "B"
+
+
+@app.post("/scrap-detail", dependencies=[Security(verify_token)])
+def scrap_detail(req: ScrapDetailRequest):
+    try:
+        from datetime import datetime, timedelta
+
+        if req.use_shift:
+            start_dt  = datetime.strptime(req.start_date, "%Y-%m-%d") + timedelta(hours=9)
+            end_dt    = datetime.strptime(req.end_date,   "%Y-%m-%d") + timedelta(hours=33)
+            date_col  = "s.Scrap_Date"
+            start_str = start_dt.strftime("%Y-%m-%d %H:%M:%S")
+            end_str   = end_dt.strftime("%Y-%m-%d %H:%M:%S")
+            prod_col  = "pe.Record_Date"
+        else:
+            date_col  = "CAST(s.Scrap_Date AS DATE)"
+            start_str = req.start_date
+            end_str   = req.end_date
+            prod_col  = "CAST(pe.Report_Date AS DATE)"
+
+        conn   = get_connection()
+        cursor = conn.cursor()
+
+        # ── Scrap detallado ───────────────────────────────────────────────
+        cursor.execute(f"""
+            SELECT
+                wc.Name                         AS Workcenter,
+                p.Part_No,
+                p.Part_Type,
+                s.Scrap_Reason,
+                s.Scrap_Date,
+                SUM(s.Quantity)                 AS Scrap_Qty,
+                ROUND(SUM(s.Extended_Cost), 2)  AS Scrap_Cost
+            FROM Part_v_Scrap s
+            INNER JOIN Part_v_Workcenter wc
+                ON s.Workcenter_Key      = wc.Workcenter_Key
+                AND s.Plexus_Customer_No = wc.Plexus_Customer_No
+            INNER JOIN Part_v_Part_e p
+                ON s.Part_Key            = p.Part_Key
+                AND s.Plexus_Customer_No = p.Plexus_Customer_No
+            WHERE s.Plexus_Customer_No = {PCN}
+              AND {date_col} >= '{start_str}'
+              AND {date_col} <  '{end_str}'
+              AND s.Quantity > 0
+            GROUP BY wc.Name, p.Part_No, p.Part_Type, s.Scrap_Reason, s.Scrap_Date
+            ORDER BY Scrap_Qty DESC
+        """)
+        scrap_rows = query_to_list(cursor)
+
+        # ── Producción por workcenter (para yield) ────────────────────────
+        cursor.execute(f"""
+            SELECT
+                wc.Name          AS Workcenter,
+                SUM(pe.Quantity) AS Quantity
+            FROM Part_v_Production_e pe
+            INNER JOIN Part_v_Workcenter wc
+                ON pe.Workcenter_Key      = wc.Workcenter_Key
+                AND pe.Plexus_Customer_No = wc.Plexus_Customer_No
+            WHERE pe.Plexus_Customer_No = {PCN}
+              AND {prod_col} >= '{start_str}'
+              AND {prod_col} <  '{end_str}'
+            GROUP BY wc.Name
+        """)
+        prod_rows = query_to_list(cursor)
+        conn.close()
+
+        # ── Helpers ───────────────────────────────────────────────────────
+        def get_bu(wc_name: str, part_no: str) -> str:
+            pno = str(part_no or "").strip().split(".")[0]
+            if wc_name in TULC_WORKCENTERS:
+                return "tulc"
+            elif pno in VOLVO_PARTS:
+                return "volvo"
+            return "cummins"
+
+        prod_map = {r["Workcenter"]: float(r["Quantity"] or 0) for r in prod_rows}
+
+        # ── by_workcenter con desglose turno A/B ──────────────────────────
+        wc_map: dict = {}
+        for r in scrap_rows:
+            wc         = r["Workcenter"]
+            part_no    = r["Part_No"] or ""
+            qty        = float(r["Scrap_Qty"]  or 0)
+            cost       = float(r["Scrap_Cost"] or 0)
+            bu         = get_bu(wc, part_no)
+            scrap_date = r["Scrap_Date"]
+            shift      = get_shift_ab(scrap_date) if scrap_date else "B"
+
+            if wc not in wc_map:
+                wc_map[wc] = {
+                    "workcenter": wc, "bu": bu,
+                    "scrap_qty": 0.0, "scrap_cost": 0.0,
+                    "shift_a": {"scrap_qty": 0.0},
+                    "shift_b": {"scrap_qty": 0.0},
+                }
+            wc_map[wc]["scrap_qty"]  += qty
+            wc_map[wc]["scrap_cost"] += cost
+            wc_map[wc][f"shift_{shift.lower()}"]["scrap_qty"] += qty
+
+        by_workcenter = []
+        for wc, d in wc_map.items():
+            prod      = prod_map.get(wc, 0.0)
+            scrap_qty = d["scrap_qty"]
+            total     = prod + scrap_qty
+            yield_pct = round(prod / total * 100, 2) if total > 0 else 100.0
+
+            sa_qty  = d["shift_a"]["scrap_qty"]
+            sb_qty  = d["shift_b"]["scrap_qty"]
+            sa_prod = prod * 0.5
+            sb_prod = prod * 0.5
+
+            by_workcenter.append({
+                "workcenter": wc,
+                "bu":         d["bu"],
+                "production": int(prod),
+                "scrap_qty":  int(scrap_qty),
+                "yield_pct":  yield_pct,
+                "scrap_cost": round(d["scrap_cost"], 2),
+                "shift_a": {
+                    "scrap_qty": int(sa_qty),
+                    "yield_pct": round((sa_prod / (sa_prod + sa_qty)) * 100, 2) if (sa_prod + sa_qty) > 0 else 100.0,
+                },
+                "shift_b": {
+                    "scrap_qty": int(sb_qty),
+                    "yield_pct": round((sb_prod / (sb_prod + sb_qty)) * 100, 2) if (sb_prod + sb_qty) > 0 else 100.0,
+                },
+            })
+        by_workcenter.sort(key=lambda x: x["yield_pct"])
+
+        # ── by_reason (Pareto) ────────────────────────────────────────────
+        reason_map: dict = {}
+        for r in scrap_rows:
+            reason = r["Scrap_Reason"] or "Sin Razón"
+            qty    = float(r["Scrap_Qty"]  or 0)
+            cost   = float(r["Scrap_Cost"] or 0)
+            if reason not in reason_map:
+                reason_map[reason] = {"scrap_reason": reason, "total_qty": 0.0, "total_cost": 0.0}
+            reason_map[reason]["total_qty"]  += qty
+            reason_map[reason]["total_cost"] += cost
+
+        total_scrap = sum(v["total_qty"] for v in reason_map.values())
+        by_reason   = sorted(reason_map.values(), key=lambda x: x["total_qty"], reverse=True)
+        cumulative  = 0.0
+        for r in by_reason:
+            r["total_qty"]      = int(r["total_qty"])
+            r["total_cost"]     = round(r["total_cost"], 2)
+            pct                 = round(r["total_qty"] / total_scrap * 100, 2) if total_scrap > 0 else 0.0
+            cumulative         += pct
+            r["pct_of_total"]   = pct
+            r["cumulative_pct"] = round(cumulative, 2)
+
+        # ── by_part ───────────────────────────────────────────────────────
+        part_map: dict = {}
+        for r in scrap_rows:
+            wc        = r["Workcenter"]
+            part_no   = str(r["Part_No"]   or "").strip().split(".")[0]
+            part_type = str(r["Part_Type"] or "").strip()
+            qty       = float(r["Scrap_Qty"]  or 0)
+            cost      = float(r["Scrap_Cost"] or 0)
+            key       = f"{part_no}|{wc}"
+            if key not in part_map:
+                part_map[key] = {
+                    "part_no":    part_no,
+                    "part_type":  part_type,
+                    "workcenter": wc,
+                    "bu":         get_bu(wc, part_no),
+                    "scrap_qty":  0.0,
+                    "scrap_cost": 0.0,
+                }
+            part_map[key]["scrap_qty"]  += qty
+            part_map[key]["scrap_cost"] += cost
+
+        by_part = sorted(part_map.values(), key=lambda x: x["scrap_qty"], reverse=True)
+        for r in by_part:
+            r["scrap_qty"]  = int(r["scrap_qty"])
+            r["scrap_cost"] = round(r["scrap_cost"], 2)
+
+        # ── heatmap turno × workcenter ────────────────────────────────────
+        heatmap_map: dict = {}
+        for r in scrap_rows:
+            wc         = r["Workcenter"]
+            qty        = float(r["Scrap_Qty"] or 0)
+            scrap_date = r["Scrap_Date"]
+            shift      = get_shift_ab(scrap_date) if scrap_date else "B"
+            key        = f"{wc}|{shift}"
+            heatmap_map[key] = heatmap_map.get(key, 0.0) + qty
+
+        by_shift = [
+            {"workcenter": k.split("|")[0], "shift": k.split("|")[1], "scrap_qty": int(v)}
+            for k, v in heatmap_map.items()
+        ]
+
+        # ── trend diaria ──────────────────────────────────────────────────
+        # ── trend diaria ──────────────────────────────────────────────────────────
+        trend_map: dict = {}
+        for r in scrap_rows:
+            scrap_date = r["Scrap_Date"]
+            if not scrap_date:
+                continue
+            if hasattr(scrap_date, 'date'):
+                day_str = scrap_date.date().isoformat()
+            else:
+                day_str = str(scrap_date)[:10]
+
+            wc      = r["Workcenter"]
+            part_no = str(r["Part_No"] or "").strip().split(".")[0]
+            bu      = get_bu(wc, part_no)
+            qty     = float(r["Scrap_Qty"]  or 0)
+            cost    = float(r["Scrap_Cost"] or 0)
+
+            if day_str not in trend_map:
+                trend_map[day_str] = {
+                    "date": day_str,
+                    "volvo_qty": 0.0, "cummins_qty": 0.0, "tulc_qty": 0.0,
+                    "total_cost": 0.0, "scrap_qty": 0.0,
+                }
+            trend_map[day_str][f"{bu}_qty"] += qty
+            trend_map[day_str]["total_cost"] += cost
+            trend_map[day_str]["scrap_qty"]  += qty
+
+        # Agregar producción por día para calcular yield
+        for day_str, entry in trend_map.items():
+            prod_day = 0.0
+            for wc, prod_qty in prod_map.items():
+                # prod_map es total del período — necesitamos por día
+                pass
+
+        # Query producción por día
+        if req.use_shift:
+            from datetime import datetime as _dt, timedelta as _td
+            start_day = _dt.strptime(req.start_date, "%Y-%m-%d")
+            end_day   = _dt.strptime(req.end_date,   "%Y-%m-%d")
+        else:
+            from datetime import datetime as _dt
+            start_day = _dt.strptime(req.start_date, "%Y-%m-%d")
+            end_day   = _dt.strptime(req.end_date,   "%Y-%m-%d")
+
+        conn2   = get_connection()
+        cursor2 = conn2.cursor()
+        cursor2.execute(f"""
+            SELECT
+                CAST(pe.Record_Date AS DATE) AS Prod_Day,
+                SUM(pe.Quantity)             AS Quantity
+            FROM Part_v_Production_e pe
+            INNER JOIN Part_v_Workcenter wc
+                ON pe.Workcenter_Key      = wc.Workcenter_Key
+                AND pe.Plexus_Customer_No = wc.Plexus_Customer_No
+            WHERE pe.Plexus_Customer_No = {PCN}
+              AND {prod_col} >= '{start_str}'
+              AND {prod_col} <  '{end_str}'
+            GROUP BY CAST(pe.Record_Date AS DATE)
+        """)
+        prod_by_day_rows = query_to_list(cursor2)
+        conn2.close()
+
+        prod_by_day: dict = {}
+        for r in prod_by_day_rows:
+            day = str(r["Prod_Day"])[:10]
+            prod_by_day[day] = float(r["Quantity"] or 0)
+
+        trend = []
+        for d in sorted(trend_map.values(), key=lambda x: x["date"]):
+            day_str       = d["date"]
+            scrap_qty     = d["scrap_qty"]
+            prod_qty      = prod_by_day.get(day_str, 0.0)
+            total_qty_day = prod_qty + scrap_qty
+            yield_pct_day = round(prod_qty / total_qty_day * 100, 2) if total_qty_day > 0 else 100.0
+            volvo_qty     = d["volvo_qty"]
+            cummins_qty   = d["cummins_qty"]
+            tulc_qty      = d["tulc_qty"]
+
+            trend.append({
+                "date":         day_str,
+                "volvo_qty":    int(volvo_qty),
+                "cummins_qty":  int(cummins_qty),
+                "tulc_qty":     int(tulc_qty),
+                "total_qty":    int(scrap_qty),
+                "total_cost":   round(d["total_cost"], 2),
+                "production":   int(prod_qty),
+                "yield_pct":    yield_pct_day,
+            })
+
+        # ── summary ───────────────────────────────────────────────────────
+        total_prod      = sum(prod_map.values())
+        total_scrap_qty = sum(r["scrap_qty"] for r in by_part)
+        total_cost      = round(sum(r["scrap_cost"] for r in by_part), 2)
+        grand_total     = total_prod + total_scrap_qty
+        yield_pct       = round(total_prod / grand_total * 100, 2) if grand_total > 0 else 100.0
+
+        return {
+            "start_date": req.start_date,
+            "end_date":   req.end_date,
+            "use_shift":  req.use_shift,
+            "summary": {
+                "total_qty":   total_scrap_qty,
+                "total_cost":  total_cost,
+                "yield_pct":   yield_pct,
+            },
+            "by_workcenter": by_workcenter,
+            "by_reason":     by_reason,
+            "by_part":       by_part,
+            "by_shift":      by_shift,
+            "trend":         trend,
+        }
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
