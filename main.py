@@ -961,6 +961,7 @@ class MaintenanceKPIRequest(BaseModel):
 @app.post("/maintenance-kpis", dependencies=[Security(verify_token)])
 def maintenance_kpis(req: MaintenanceKPIRequest):
     try:
+        end_inclusive = f"{req.end_date} 23:59:59"
         conn   = get_connection()
         cursor = conn.cursor()
         cursor.execute(f"""
@@ -988,15 +989,13 @@ def maintenance_kpis(req: MaintenanceKPIRequest):
             FROM Part_v_Workcenter_Log wl
             WHERE wl.Plexus_Customer_No = {PCN}
               AND wl.Log_Date >= '{req.start_date}'
-              AND wl.Log_Date <  '{req.end_date}'
+              AND wl.Log_Date <= '{end_inclusive}'
               AND wl.Log_Hours > 0
         """)
         row = cursor.fetchone()
         conn.close()
         if not row:
             return {"data": None}
-        cols = [d[0] for d in cursor.description] if cursor.description else []
-        # cursor ya cerrado — reconstruir desde row directamente
         keys = [
             "operating_hours", "downtime_hours", "down_hours", "setup_hours",
             "idle_hours", "total_failures", "mttr_hours", "mtbf_hours", "availability_pct"
@@ -1015,6 +1014,7 @@ def maintenance_kpis(req: MaintenanceKPIRequest):
 @app.post("/maintenance-downtime-reasons", dependencies=[Security(verify_token)])
 def maintenance_downtime_reasons(req: MaintenanceKPIRequest):
     try:
+        end_inclusive = f"{req.end_date} 23:59:59"
         conn   = get_connection()
         cursor = conn.cursor()
         cursor.execute(f"""
@@ -1028,7 +1028,7 @@ def maintenance_downtime_reasons(req: MaintenanceKPIRequest):
                 AND wl.Plexus_Customer_No = we.Plexus_Customer_No
             WHERE wl.Plexus_Customer_No = {PCN}
               AND wl.Log_Date >= '{req.start_date}'
-              AND wl.Log_Date <  '{req.end_date}'
+              AND wl.Log_Date <= '{end_inclusive}'
               AND wl.Workcenter_Status_Key IN (5445, 5449)
               AND wl.Log_Hours > 0
             GROUP BY we.Description
@@ -1062,6 +1062,7 @@ class MaintenanceDetailRequest(BaseModel):
 @app.post("/maintenance-downtime-detail", dependencies=[Security(verify_token)])
 def maintenance_downtime_detail(req: MaintenanceDetailRequest):
     try:
+        end_inclusive = f"{req.end_date} 23:59:59"
         reason_filter = req.reason.replace("'", "''")
         conn   = get_connection()
         cursor = conn.cursor()
@@ -1102,7 +1103,7 @@ def maintenance_downtime_detail(req: MaintenanceDetailRequest):
                 AND wl.Plexus_Customer_No = jo.PCN
             WHERE wl.Plexus_Customer_No = {PCN}
               AND wl.Log_Date >= '{req.start_date}'
-              AND wl.Log_Date <  '{req.end_date}'
+              AND wl.Log_Date <= '{end_inclusive}'
               AND wl.Workcenter_Status_Key IN (5445, 5449)
               AND wl.Log_Hours > 0
               AND ISNULL(we.Description, 'Sin Razón') = '{reason_filter}'
@@ -1114,9 +1115,11 @@ def maintenance_downtime_detail(req: MaintenanceDetailRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
 @app.post("/maintenance-downtime-by-month", dependencies=[Security(verify_token)])
 def maintenance_downtime_by_month(req: MaintenanceKPIRequest):
     try:
+        end_inclusive = f"{req.end_date} 23:59:59"
         conn   = get_connection()
         cursor = conn.cursor()
         cursor.execute(f"""
@@ -1133,7 +1136,7 @@ def maintenance_downtime_by_month(req: MaintenanceKPIRequest):
                 AND wl.Plexus_Customer_No  = we.Plexus_Customer_No
             WHERE wl.Plexus_Customer_No = {PCN}
               AND wl.Log_Date >= '{req.start_date}'
-              AND wl.Log_Date <  '{req.end_date}'
+              AND wl.Log_Date <= '{end_inclusive}'
               AND wl.Workcenter_Status_Key IN (5445, 5449)
               AND wl.Log_Hours > 0
             GROUP BY
@@ -1152,7 +1155,7 @@ def maintenance_downtime_by_month(req: MaintenanceKPIRequest):
             month = int(r["Month"] or 0)
             day   = int(r["Day"]   or 0)
             result.append({
-                "date":         f"{year:04d}-{month:02d}-{day:02d}",  # "2026-03-15"
+                "date":         f"{year:04d}-{month:02d}-{day:02d}",
                 "reason":       r["Reason"],
                 "total_events": int(r["Total_Events"]  or 0),
                 "total_hours":  float(r["Total_Hours"] or 0),
@@ -1169,6 +1172,7 @@ class WorkRequestsRequest(BaseModel):
 @app.post("/work-requests", dependencies=[Security(verify_token)])
 def work_requests(req: WorkRequestsRequest):
     try:
+        end_inclusive = f"{req.end_date} 23:59:59"
         conn   = get_connection()
         cursor = conn.cursor()
         cursor.execute(f"""
@@ -1220,7 +1224,7 @@ def work_requests(req: WorkRequestsRequest):
                 ON wr.Work_Request_Key = el.Work_Request_Key
             WHERE wr.Plexus_Customer_No = {PCN}
               AND wr.Request_Date >= '{req.start_date}'
-              AND wr.Request_Date <= '{req.end_date}'
+              AND wr.Request_Date <= '{end_inclusive}'
         """)
         rows = query_to_list(cursor)
         conn.close()
@@ -1250,7 +1254,6 @@ def work_requests(req: WorkRequestsRequest):
         return {"data": result}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
 
 class OEERequest(BaseModel):
     start_date: str
@@ -1722,5 +1725,33 @@ def scrap_detail(req: ScrapDetailRequest):
             "trend":         trend,
         }
 
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    
+# ─── Equipment catalog ────────────────────────────────────────────────────────
+
+@app.get("/equipment", dependencies=[Security(verify_token)])
+def equipment_list():
+    try:
+        conn   = get_connection()
+        cursor = conn.cursor()
+        cursor.execute(f"""
+            SELECT
+                eq.Equipment_Key,
+                eq.Equipment_ID,
+                eq.Description,
+                eq.Equipment_Group,
+                wc.Name AS Workcenter
+            FROM Maintenance_v_Equipment eq
+            LEFT JOIN Part_v_Workcenter wc
+                ON eq.Workcenter_Key      = wc.Workcenter_Key
+                AND eq.Plexus_Customer_No = wc.Plexus_Customer_No
+            WHERE eq.Plexus_Customer_No = {PCN}
+              AND eq.Active = 1
+            ORDER BY eq.Equipment_Group, eq.Equipment_ID
+        """)
+        rows = query_to_list(cursor)
+        conn.close()
+        return {"data": rows}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
