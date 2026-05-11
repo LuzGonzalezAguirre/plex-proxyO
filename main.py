@@ -536,7 +536,7 @@ TULC_WORKCENTERS = {"TULC Ensamble Final"}
 
 VOLVO_PARTS       = {"43301", "43302", "43303", "43304", "43305", "43306", "43291", "45294"}
 VOLVO_WORKCENTERS = {"HM Ensamble Final 2"}
-CUMMINS_WORKCENTERS = {"HM Ensamble de Servicio", "HM Empaque"}
+CUMMINS_WORKCENTERS = {"HM Ensamble Final 3", "HM Ensamble Frontal 3"}
 ALL_PROD_WORKCENTERS = VOLVO_WORKCENTERS | CUMMINS_WORKCENTERS | TULC_WORKCENTERS
 WC_LIST = "', '".join(ALL_PROD_WORKCENTERS)
 
@@ -1488,12 +1488,13 @@ def scrap_detail(req: ScrapDetailRequest):
 
         # ── Helpers ───────────────────────────────────────────────────────
         def get_bu(wc_name: str, part_no: str) -> str:
-            pno = str(part_no or "").strip().split(".")[0]
             if wc_name in TULC_WORKCENTERS:
                 return "tulc"
-            elif pno in VOLVO_PARTS:
+            elif wc_name in VOLVO_WORKCENTERS:
                 return "volvo"
-            return "cummins"
+            elif wc_name in CUMMINS_WORKCENTERS:
+                return "cummins"
+            return "cummins"  # fallback por si hay scrap en otros WC
 
         prod_map = {r["Workcenter"]: float(r["Quantity"] or 0) for r in prod_rows}
 
@@ -1755,3 +1756,4 @@ def equipment_list():
         return {"data": rows}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+    
