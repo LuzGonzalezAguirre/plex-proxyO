@@ -19,6 +19,7 @@ app = FastAPI(title="Plex ODBC Proxy", version="1.0.0")
 security = HTTPBearer()
 
 
+
 def verify_token(credentials: HTTPAuthorizationCredentials = Security(security)):
     if credentials.credentials != SECRET:
         raise HTTPException(status_code=401, detail="Invalid token")
