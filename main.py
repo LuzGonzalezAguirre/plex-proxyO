@@ -533,6 +533,21 @@ def get_shift_range(report_date: str) -> tuple[str, str]:
     return shift_start.strftime("%Y-%m-%d %H:%M:%S"), shift_end.strftime("%Y-%m-%d %H:%M:%S")
 
 
+def get_shift_window(start_date: str, end_date: str, offset_hours: int = 6) -> tuple[str, str]:
+    """
+    Ventana de turno [start_date + offset_hours, end_date + 1 dia + offset_hours)
+    para rangos multi-dia (a diferencia de get_shift_range, que es para un solo dia).
+    Calculado en Python e inyectado como string literal en el SQL -- DATEADD(...)
+    dentro de un WHERE no funciona en el driver ODBC de Plex aunque evaluado de
+    forma aislada (SELECT DATEADD(...)) si de un valor correcto (confirmado
+    empiricamente contra Part_v_Workcenter_Log).
+    """
+    from datetime import datetime, timedelta
+    start = datetime.strptime(start_date, "%Y-%m-%d") + timedelta(hours=offset_hours)
+    end   = datetime.strptime(end_date,   "%Y-%m-%d") + timedelta(days=1, hours=offset_hours)
+    return start.strftime("%Y-%m-%d %H:%M:%S"), end.strftime("%Y-%m-%d %H:%M:%S")
+
+
 TULC_WORKCENTERS = {"TULC Ensamble Final"}
 
 VOLVO_PARTS       = {"43301", "43302", "43303", "43304", "43305", "43306", "43291", "45294"}
@@ -962,7 +977,7 @@ class MaintenanceKPIRequest(BaseModel):
 @app.post("/maintenance-kpis", dependencies=[Security(verify_token)])
 def maintenance_kpis(req: MaintenanceKPIRequest):
     try:
-        end_inclusive = f"{req.end_date} 23:59:59"
+        shift_start, shift_end = get_shift_window(req.start_date, req.end_date)
         conn   = get_connection()
         cursor = conn.cursor()
         cursor.execute(f"""
@@ -989,8 +1004,8 @@ def maintenance_kpis(req: MaintenanceKPIRequest):
                 , 2) AS Availability_Pct
             FROM Part_v_Workcenter_Log wl
             WHERE wl.Plexus_Customer_No = {PCN}
-              AND wl.Log_Date >= '{req.start_date}'
-              AND wl.Log_Date <= '{end_inclusive}'
+              AND wl.Log_Date >= '{shift_start}'
+              AND wl.Log_Date <  '{shift_end}'
               AND wl.Log_Hours > 0
         """)
         row = cursor.fetchone()
@@ -1015,7 +1030,7 @@ def maintenance_kpis(req: MaintenanceKPIRequest):
 @app.post("/maintenance-downtime-reasons", dependencies=[Security(verify_token)])
 def maintenance_downtime_reasons(req: MaintenanceKPIRequest):
     try:
-        end_inclusive = f"{req.end_date} 23:59:59"
+        shift_start, shift_end = get_shift_window(req.start_date, req.end_date)
         conn   = get_connection()
         cursor = conn.cursor()
         cursor.execute(f"""
@@ -1028,8 +1043,8 @@ def maintenance_downtime_reasons(req: MaintenanceKPIRequest):
                 ON wl.Workcenter_Event_Key = we.Workcenter_Event_Key
                 AND wl.Plexus_Customer_No = we.Plexus_Customer_No
             WHERE wl.Plexus_Customer_No = {PCN}
-              AND wl.Log_Date >= '{req.start_date}'
-              AND wl.Log_Date <= '{end_inclusive}'
+              AND wl.Log_Date >= '{shift_start}'
+              AND wl.Log_Date <  '{shift_end}'
               AND wl.Workcenter_Status_Key IN (5445, 5449)
               AND wl.Log_Hours > 0
             GROUP BY we.Description
@@ -1063,7 +1078,7 @@ class MaintenanceDetailRequest(BaseModel):
 @app.post("/maintenance-downtime-detail", dependencies=[Security(verify_token)])
 def maintenance_downtime_detail(req: MaintenanceDetailRequest):
     try:
-        end_inclusive = f"{req.end_date} 23:59:59"
+        shift_start, shift_end = get_shift_window(req.start_date, req.end_date)
         reason_filter = req.reason.replace("'", "''")
         conn   = get_connection()
         cursor = conn.cursor()
@@ -1103,8 +1118,8 @@ def maintenance_downtime_detail(req: MaintenanceDetailRequest):
                 ON wl.Job_Op_Key = jo.Job_Key
                 AND wl.Plexus_Customer_No = jo.PCN
             WHERE wl.Plexus_Customer_No = {PCN}
-              AND wl.Log_Date >= '{req.start_date}'
-              AND wl.Log_Date <= '{end_inclusive}'
+              AND wl.Log_Date >= '{shift_start}'
+              AND wl.Log_Date <  '{shift_end}'
               AND wl.Workcenter_Status_Key IN (5445, 5449)
               AND wl.Log_Hours > 0
               AND ISNULL(we.Description, 'Sin Razón') = '{reason_filter}'
@@ -1120,7 +1135,7 @@ def maintenance_downtime_detail(req: MaintenanceDetailRequest):
 @app.post("/maintenance-downtime-by-month", dependencies=[Security(verify_token)])
 def maintenance_downtime_by_month(req: MaintenanceKPIRequest):
     try:
-        end_inclusive = f"{req.end_date} 23:59:59"
+        shift_start, shift_end = get_shift_window(req.start_date, req.end_date)
         conn   = get_connection()
         cursor = conn.cursor()
         cursor.execute(f"""
@@ -1136,8 +1151,8 @@ def maintenance_downtime_by_month(req: MaintenanceKPIRequest):
                 ON wl.Workcenter_Event_Key = we.Workcenter_Event_Key
                 AND wl.Plexus_Customer_No  = we.Plexus_Customer_No
             WHERE wl.Plexus_Customer_No = {PCN}
-              AND wl.Log_Date >= '{req.start_date}'
-              AND wl.Log_Date <= '{end_inclusive}'
+              AND wl.Log_Date >= '{shift_start}'
+              AND wl.Log_Date <  '{shift_end}'
               AND wl.Workcenter_Status_Key IN (5445, 5449)
               AND wl.Log_Hours > 0
             GROUP BY
@@ -1263,134 +1278,167 @@ class OEERequest(BaseModel):
 @app.post("/oee-live")
 def oee_live(req: OEERequest):
     try:
+        from datetime import date as dt
+        from collections import defaultdict
+
+        dt.fromisoformat(req.start_date)
+        dt.fromisoformat(req.end_date)
+        shift_start, shift_end = get_shift_window(req.start_date, req.end_date)
+
         with get_connection() as conn:
             cursor = conn.cursor()
 
-            # ── 1. Availability POR WORKCENTER ───────────────────────────────
+            # ── 1. Producción detallada por operación (no colapsada a nivel Part/Workcenter) ──
             cursor.execute(f"""
                 SELECT
-                    wc.Name AS Workcenter,
-                    SUM(CASE WHEN wl.Workcenter_Status_Key = 5448 THEN wl.Log_Hours ELSE 0 END) AS Operating_Hours,
-                    SUM(CASE WHEN wl.Workcenter_Status_Key IN (5448,5445,5449) THEN wl.Log_Hours ELSE 0 END) AS Plan_Hours
-                FROM Part_v_Workcenter_Log AS wl
-                INNER JOIN Part_v_Workcenter AS wc
-                    ON wl.Workcenter_Key = wc.Workcenter_Key AND wl.Plexus_Customer_No = wc.Plexus_Customer_No
-                WHERE wl.Plexus_Customer_No = 306713
-                  AND wl.Log_Hours > 0
-                  AND CAST(wl.Log_Date AS DATE) >= '{req.start_date}'
-                  AND CAST(wl.Log_Date AS DATE) <= '{req.end_date}'
-                GROUP BY wc.Name
-            """)
-            availability = {r[0]: {"operating": float(r[1] or 0), "plan": float(r[2] or 0)}
-                            for r in cursor.fetchall()}
-
-            # ── 2. Production por WC ─────────────────────────────────────────
-            cursor.execute(f"""
-                SELECT wc.Name, SUM(pe.Quantity)
+                    pt.Part_No, pt.Revision, wc.Name AS Workcenter,
+                    pe.Part_Operation_Key, SUM(pe.Quantity) AS Good_Qty
                 FROM Part_v_Production_e AS pe
                 INNER JOIN Part_v_Workcenter AS wc
-                    ON pe.Workcenter_Key = wc.Workcenter_Key AND pe.Plexus_Customer_No = wc.Plexus_Customer_No
-                WHERE pe.Plexus_Customer_No = 306713
-                  AND CAST(pe.Report_Date AS DATE) >= '{req.start_date}'
-                  AND CAST(pe.Report_Date AS DATE) <= '{req.end_date}'
-                GROUP BY wc.Name
+                    ON pe.Workcenter_Key = wc.Workcenter_Key
+                    AND pe.Plexus_Customer_No = wc.Plexus_Customer_No
+                INNER JOIN Part_v_Part AS pt
+                    ON pe.Part_Key = pt.Part_Key
+                    AND pe.Plexus_Customer_No = pt.Plexus_Customer_No
+                WHERE pe.Plexus_Customer_No = {PCN}
+                    AND CAST(pe.Report_Date AS DATE) >= '{req.start_date}'
+                    AND CAST(pe.Report_Date AS DATE) <= '{req.end_date}'
+                GROUP BY pt.Part_No, pt.Revision, wc.Name, pe.Part_Operation_Key
             """)
-            production = {r[0]: float(r[1] or 0) for r in cursor.fetchall()}
+            production_detail = cursor.fetchall()
 
-            # ── 3. Scrap por WC ──────────────────────────────────────────────
+            # ── 2. Tasa ideal por operación (Plex, no hardcodeada) ───────────────────────────
+            cursor.execute("""
+                SELECT aw.Part_Operation_Key, wc.Name AS Workcenter, MAX(aw.Ideal_Rate) AS Ideal_Rate
+                FROM Part_v_Approved_Workcenter AS aw
+                INNER JOIN Part_v_Workcenter AS wc
+                    ON aw.Workcenter_Key = wc.Workcenter_Key
+                GROUP BY aw.Part_Operation_Key, wc.Name
+            """)
+            ideal_rate_detail = {(r[0], r[1]): float(r[2]) for r in cursor.fetchall() if r[2]}
+
+            # ── 3. Scrap por Part/Revision/Workcenter ────────────────────────────────────────
             cursor.execute(f"""
-                SELECT wc.Name, SUM(s.Quantity)
+                SELECT pt.Part_No, pt.Revision, wc.Name AS Workcenter, SUM(s.Quantity) AS Scrap_Qty
                 FROM Part_v_Scrap AS s
                 INNER JOIN Part_v_Workcenter AS wc
-                    ON s.Workcenter_Key = wc.Workcenter_Key AND s.Plexus_Customer_No = wc.Plexus_Customer_No
+                    ON s.Workcenter_Key = wc.Workcenter_Key
+                    AND s.Plexus_Customer_No = wc.Plexus_Customer_No
                 INNER JOIN Part_v_Part AS pt
-                    ON s.Part_Key = pt.Part_Key AND s.Plexus_Customer_No = pt.Plexus_Customer_No
-                WHERE s.Plexus_Customer_No = 306713
-                  AND CAST(s.Scrap_Date AS DATE) >= '{req.start_date}'
-                  AND CAST(s.Scrap_Date AS DATE) <= '{req.end_date}'
-                  AND pt.Part_No LIKE '%.2'
-                GROUP BY wc.Name
+                    ON s.Part_Key = pt.Part_Key
+                    AND s.Plexus_Customer_No = pt.Plexus_Customer_No
+                WHERE s.Plexus_Customer_No = {PCN}
+                    AND CAST(s.Scrap_Date AS DATE) >= '{req.start_date}'
+                    AND CAST(s.Scrap_Date AS DATE) <= '{req.end_date}'
+                GROUP BY pt.Part_No, pt.Revision, wc.Name
             """)
-            scrap = {r[0]: float(r[1] or 0) for r in cursor.fetchall()}
+            scrap = {(r[0], r[1], r[2]): float(r[3] or 0) for r in cursor.fetchall()}
 
-        IDEAL_RATES = {
-            'HM Auto Siphon / Return Tube Bend':       60.0,
-            'HM Doblado de Siphon':                    60.0,
-            'HM Doblado Manual para Tubo de Retorno':  180.0,
-            'HM Dobladora Unison':                     60.0,
-            'HM Empaque':                              79.0,
-            'HM Ensamble Bobina':                      72.0,
-            'HM Ensamble de Servicio':                 35.0,
-            'HM Ensamble Final':                       50.0,
-            'HM Ensamble Final 2':                     50.0,
-            'HM Ensamble Final 3':                     50.0,
-            'HM Ensamble Frontal':                     50.0,
-            'HM Ensamble Frontal 2':                   50.0,
-            'HM Ensamble Frontal 3':                   50.0,
-            'HM Lavado':                               120.0,
-            'HM O-Ring':                               120.0,
-            'HM Prensa para Muesca':                   240.0,
-            'HM Proto 1':                              180.0,
-            'HM Soldadura de Siphon':                  60.0,
-            'HM Weld':                                 60.0,
-            'TULC Doblado de PZT':                     0.0,
-            'TULC Encapsulado Final':                  0.0,
-            'TULC Ensamble de Cable':                  0.0,
-            'TULC Ensamble de Sensor':                 110.0,
-            'TULC Ensamble Final':                     79.0,
-            'TULC Perforación Final':                  150.0,
-            'TULC Soldadura de Sensores':              138.0,
-            'Velocidad Corte y Formado de IC':         164.0,
-            'Velocidad Ensamble de Copa':              180.0,
-            'Velocidad Ensamble de Transportador':     225.0,
-            'Velocidad Moldeo AS1':                    168.0,
-            'Velocidad Prueba Final':                  225.0,
-            'Velocidad QC Inspección':                 225.0,
+            # ── 4. Horas operando / planeadas por Part/Revision/Workcenter ──────────────────
+            cursor.execute(f"""
+                SELECT
+                    pt.Part_No, pt.Revision, wc.Name AS Workcenter,
+                    ISNULL(SUM(CASE WHEN wl.Workcenter_Status_Key = 5448 THEN wl.Log_Hours ELSE 0 END), 0) AS Operating_Hours,
+                    ISNULL(SUM(CASE WHEN wl.Workcenter_Status_Key IN (5448,5445,5449) THEN wl.Log_Hours ELSE 0 END), 0) AS Plan_Hours
+                FROM Part_v_Workcenter_Log AS wl
+                INNER JOIN Part_v_Part AS pt ON wl.Part_Key = pt.Part_Key
+                INNER JOIN Part_v_Workcenter AS wc ON wl.Workcenter_Key = wc.Workcenter_Key
+                WHERE wl.Plexus_Customer_No = {PCN}
+                    AND wl.Log_Date >= '{shift_start}'
+                    AND wl.Log_Date <  '{shift_end}'
+                GROUP BY pt.Part_No, pt.Revision, wc.Name
+            """)
+            operating_hours = {(r[0], r[1], r[2]): (float(r[3] or 0), float(r[4] or 0)) for r in cursor.fetchall()}
+
+        # ── Agregación en Python (equivalente a los CTEs ideal_run_time / avg_ideal_rate /
+        #    all_combinations / oee_calc — el driver ODBC de Plex no soporta CTEs) ──────────
+        good_qty_by_key         = defaultdict(float)
+        ideal_hours_good_by_key = defaultdict(float)
+        for part_no, revision, workcenter, op_key, qty in production_detail:
+            key  = (part_no, revision, workcenter)
+            qty  = float(qty or 0)
+            good_qty_by_key[key] += qty
+            rate = ideal_rate_detail.get((op_key, workcenter))
+            if rate:
+                ideal_hours_good_by_key[key] += qty / rate
+
+        effective_ideal_rate = {
+            key: good_qty_by_key[key] / ideal_hours_good_by_key[key]
+            for key in ideal_hours_good_by_key
+            if ideal_hours_good_by_key[key] > 0
         }
 
-        # Número de días del rango para normalizar ideal_output
-        from datetime import date as dt
-        d0   = dt.fromisoformat(req.start_date)
-        d1   = dt.fromisoformat(req.end_date)
-        days = max((d1 - d0).days + 1, 1)
+        all_keys = set(good_qty_by_key) | set(operating_hours)
 
-        total_good         = 0.0
-        total_qty          = 0.0
-        total_ideal_output = 0.0
-        total_operating    = 0.0
-        total_plan         = 0.0
+        details = []
+        totals = {"good_qty": 0.0, "scrap_qty": 0.0, "total_qty": 0.0,
+                  "operating_hours": 0.0, "plan_hours": 0.0, "ideal_hours_total": 0.0}
 
-        all_wc = set(availability.keys()) | set(production.keys()) | set(scrap.keys())
-        for wc in all_wc:
-            ideal_rate = IDEAL_RATES.get(wc, 0.0)
-            av         = availability.get(wc, {"operating": 0.0, "plan": 0.0})
-            op_hrs     = av["operating"]
-            plan_hrs   = av["plan"]
-            good       = production.get(wc, 0.0)
-            scrap_qty  = scrap.get(wc, 0.0)
-            total      = good + scrap_qty
+        for key in all_keys:
+            part_no, revision, workcenter = key
+            good_qty  = good_qty_by_key.get(key, 0.0)
+            scrap_qty = scrap.get(key, 0.0)
+            total_qty = good_qty + scrap_qty
+            op_hrs, plan_hrs = operating_hours.get(key, (0.0, 0.0))
+            eff_rate  = effective_ideal_rate.get(key)
 
-            total_operating += op_hrs
-            total_plan      += plan_hrs
-            total_good      += good
-            total_qty       += total
+            # Si no hay tasa ideal efectiva para este Part/Workcenter, las horas
+            # ideales totales quedan indefinidas (igual que NULL en el SQL original)
+            # y Performance cae a 0 solo para esta fila.
+            ideal_hours_total = (
+                ideal_hours_good_by_key.get(key, 0.0) + (scrap_qty / eff_rate)
+                if eff_rate else None
+            )
 
-            if ideal_rate > 0 and op_hrs > 0:
-                total_ideal_output += op_hrs * ideal_rate
+            availability_pct = round(op_hrs * 100.0 / plan_hrs, 2) if plan_hrs > 0 else 0.0
+            performance_pct  = (
+                round(ideal_hours_total * 100.0 / op_hrs, 2)
+                if (ideal_hours_total is not None and op_hrs > 0) else 0.0
+            )
+            quality_pct = round(good_qty * 100.0 / total_qty, 2) if total_qty > 0 else 0.0
+            oee_pct     = round(
+                min((availability_pct / 100) * (performance_pct / 100) * (quality_pct / 100) * 100, 100.0)
+            , 2)
 
-        availability_pct = min((total_operating / total_plan * 100), 100.0)  if total_plan      > 0 else 0.0
-        performance_pct  = min((total_qty / total_ideal_output * 100), 100.0) if total_ideal_output > 0 else 0.0
-        quality_pct      = min((total_good / total_qty * 100), 100.0)         if total_qty       > 0 else 0.0
-        oee_pct          = (availability_pct / 100) * (performance_pct / 100) * (quality_pct / 100) * 100
+            details.append({
+                "part_workcenter":  f"{part_no} Rev:{revision} - {workcenter}",
+                "good_qty":         good_qty,
+                "scrap_qty":        scrap_qty,
+                "total_qty":        total_qty,
+                "availability_pct": availability_pct,
+                "performance_pct":  performance_pct,
+                "quality_pct":      quality_pct,
+                "oee_pct":          oee_pct,
+            })
 
-        return {
-            "data": {
-                "availability_pct": round(availability_pct, 2),
-                "performance_pct":  round(performance_pct, 2),
-                "quality_pct":      round(quality_pct, 2),
-                "oee_pct":          round(oee_pct, 2),
-            }
+            totals["good_qty"]        += good_qty
+            totals["scrap_qty"]       += scrap_qty
+            totals["total_qty"]       += total_qty
+            totals["operating_hours"] += op_hrs
+            totals["plan_hours"]      += plan_hrs
+            if ideal_hours_total is not None:
+                totals["ideal_hours_total"] += ideal_hours_total
+
+        total_availability = round(totals["operating_hours"] * 100.0 / totals["plan_hours"], 2) if totals["plan_hours"] > 0 else 0.0
+        total_performance  = round(totals["ideal_hours_total"] * 100.0 / totals["operating_hours"], 2) if totals["operating_hours"] > 0 else 0.0
+        total_quality      = round(totals["good_qty"] * 100.0 / totals["total_qty"], 2) if totals["total_qty"] > 0 else 0.0
+        total_oee          = round(
+            min((total_availability / 100) * (total_performance / 100) * (total_quality / 100) * 100, 100.0)
+        , 2)
+
+        total = {
+            "part_workcenter":  "TOTAL",
+            "good_qty":         totals["good_qty"],
+            "scrap_qty":        totals["scrap_qty"],
+            "total_qty":        totals["total_qty"],
+            "availability_pct": total_availability,
+            "performance_pct":  total_performance,
+            "quality_pct":      total_quality,
+            "oee_pct":          total_oee,
         }
+
+        details.sort(key=lambda d: d["part_workcenter"], reverse=True)
+        return {"data": {"details": details, "total": total}}
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -1755,5 +1803,83 @@ def equipment_list():
         rows = query_to_list(cursor)
         conn.close()
         return {"data": rows}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ─── Incoming Inspection ──────────────────────────────────────────────────────
+
+@app.post("/incoming-inspection/snapshot", dependencies=[Security(verify_token)])
+def incoming_inspection_snapshot():
+    try:
+        conn   = get_connection()
+        cursor = conn.cursor()
+        # Part_v_Container no expone Part_No/Operation_No directamente —
+        # se resuelven vía Part_v_Part (Part_Key) y Part_v_Part_Operation
+        # (Part_Operation_Key), confirmado empíricamente contra el schema real.
+        cursor.execute(f"""
+            SELECT
+                c.Container_Key,
+                p.Part_No,
+                c.Part_Operation_Key,
+                po.Operation_No,
+                c.Location,
+                c.Quantity,
+                c.Active
+            FROM Part_v_Container c
+            LEFT JOIN Part_v_Part p
+                ON c.Part_Key = p.Part_Key
+               AND c.Plexus_Customer_No = p.Plexus_Customer_No
+            LEFT JOIN Part_v_Part_Operation po
+                ON c.Part_Operation_Key = po.Part_Operation_Key
+               AND c.Plexus_Customer_No = po.Plexus_Customer_No
+            WHERE c.Plexus_Customer_No = {PCN}
+              AND c.Location LIKE '%TJ Incoming Inspection%'
+        """)
+        data = query_to_list(cursor)
+        conn.close()
+        return {"data": data}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class IncomingInspectionHistoryRequest(BaseModel):
+    since: str  # 'YYYY-MM-DD HH:MM:SS'
+
+
+@app.post("/incoming-inspection/history", dependencies=[Security(verify_token)])
+def incoming_inspection_history(req: IncomingInspectionHistoryRequest):
+    try:
+        conn   = get_connection()
+        cursor = conn.cursor()
+        # Mismo caso que /incoming-inspection/snapshot: Part_v_Container_Change2
+        # tampoco expone Part_No/Operation_No directamente.
+        cursor.execute(f"""
+            SELECT
+                cc.Serial_No,
+                p.Part_No,
+                cc.Part_Key,
+                po.Operation_No,
+                cc.Change_Date,
+                cc.Last_Action,
+                cc.Location,
+                cc.Container_Status,
+                cc.Defect_Type,
+                cc.Note,
+                cc.Change_By
+            FROM Part_v_Container_Change2 cc
+            LEFT JOIN Part_v_Part p
+                ON cc.Part_Key = p.Part_Key
+               AND cc.Plexus_Customer_No = p.Plexus_Customer_No
+            LEFT JOIN Part_v_Part_Operation po
+                ON cc.Part_Operation_Key = po.Part_Operation_Key
+               AND cc.Plexus_Customer_No = po.Plexus_Customer_No
+            WHERE cc.Plexus_Customer_No = {PCN}
+              AND po.Operation_No IN (10, 11, 20)
+              AND cc.Change_Date >= '{req.since}'
+        """)
+        data = query_to_list(cursor)
+        conn.close()
+        return {"data": data}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
