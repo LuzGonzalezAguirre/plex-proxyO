@@ -6,6 +6,7 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 from typing import Optional
 from dotenv import load_dotenv
+from oee_router import router as oee_router_router
 
 load_dotenv()
 
@@ -17,7 +18,7 @@ PCN      = 306713
 
 app = FastAPI(title="Plex ODBC Proxy", version="1.0.0")
 security = HTTPBearer()
-
+app.include_router(oee_router_router)
 
 
 def verify_token(credentials: HTTPAuthorizationCredentials = Security(security)):
@@ -1072,14 +1073,19 @@ def maintenance_downtime_reasons(req: MaintenanceKPIRequest):
 class MaintenanceDetailRequest(BaseModel):
     start_date: str
     end_date:   str
-    reason:     str
+    reason:     Optional[str] = None
 
 
 @app.post("/maintenance-downtime-detail", dependencies=[Security(verify_token)])
 def maintenance_downtime_detail(req: MaintenanceDetailRequest):
     try:
         shift_start, shift_end = get_shift_window(req.start_date, req.end_date)
-        reason_filter = req.reason.replace("'", "''")
+
+        reason_clause = ""
+        if req.reason:
+            reason_filter = req.reason.replace("'", "''")
+            reason_clause = f"AND ISNULL(we.Description, 'Sin Razón') = '{reason_filter}'"
+
         conn   = get_connection()
         cursor = conn.cursor()
         cursor.execute(f"""
@@ -1122,7 +1128,7 @@ def maintenance_downtime_detail(req: MaintenanceDetailRequest):
               AND wl.Log_Date <  '{shift_end}'
               AND wl.Workcenter_Status_Key IN (5445, 5449)
               AND wl.Log_Hours > 0
-              AND ISNULL(we.Description, 'Sin Razón') = '{reason_filter}'
+              {reason_clause}
             ORDER BY wl.Log_Date
         """)
         data = query_to_list(cursor)
@@ -1271,177 +1277,6 @@ def work_requests(req: WorkRequestsRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-class OEERequest(BaseModel):
-    start_date: str
-    end_date: str
-
-@app.post("/oee-live")
-def oee_live(req: OEERequest):
-    try:
-        from datetime import date as dt
-        from collections import defaultdict
-
-        dt.fromisoformat(req.start_date)
-        dt.fromisoformat(req.end_date)
-        shift_start, shift_end = get_shift_window(req.start_date, req.end_date)
-
-        with get_connection() as conn:
-            cursor = conn.cursor()
-
-            # ── 1. Producción detallada por operación (no colapsada a nivel Part/Workcenter) ──
-            cursor.execute(f"""
-                SELECT
-                    pt.Part_No, pt.Revision, wc.Name AS Workcenter,
-                    pe.Part_Operation_Key, SUM(pe.Quantity) AS Good_Qty
-                FROM Part_v_Production_e AS pe
-                INNER JOIN Part_v_Workcenter AS wc
-                    ON pe.Workcenter_Key = wc.Workcenter_Key
-                    AND pe.Plexus_Customer_No = wc.Plexus_Customer_No
-                INNER JOIN Part_v_Part AS pt
-                    ON pe.Part_Key = pt.Part_Key
-                    AND pe.Plexus_Customer_No = pt.Plexus_Customer_No
-                WHERE pe.Plexus_Customer_No = {PCN}
-                    AND CAST(pe.Report_Date AS DATE) >= '{req.start_date}'
-                    AND CAST(pe.Report_Date AS DATE) <= '{req.end_date}'
-                GROUP BY pt.Part_No, pt.Revision, wc.Name, pe.Part_Operation_Key
-            """)
-            production_detail = cursor.fetchall()
-
-            # ── 2. Tasa ideal por operación (Plex, no hardcodeada) ───────────────────────────
-            cursor.execute("""
-                SELECT aw.Part_Operation_Key, wc.Name AS Workcenter, MAX(aw.Ideal_Rate) AS Ideal_Rate
-                FROM Part_v_Approved_Workcenter AS aw
-                INNER JOIN Part_v_Workcenter AS wc
-                    ON aw.Workcenter_Key = wc.Workcenter_Key
-                GROUP BY aw.Part_Operation_Key, wc.Name
-            """)
-            ideal_rate_detail = {(r[0], r[1]): float(r[2]) for r in cursor.fetchall() if r[2]}
-
-            # ── 3. Scrap por Part/Revision/Workcenter ────────────────────────────────────────
-            cursor.execute(f"""
-                SELECT pt.Part_No, pt.Revision, wc.Name AS Workcenter, SUM(s.Quantity) AS Scrap_Qty
-                FROM Part_v_Scrap AS s
-                INNER JOIN Part_v_Workcenter AS wc
-                    ON s.Workcenter_Key = wc.Workcenter_Key
-                    AND s.Plexus_Customer_No = wc.Plexus_Customer_No
-                INNER JOIN Part_v_Part AS pt
-                    ON s.Part_Key = pt.Part_Key
-                    AND s.Plexus_Customer_No = pt.Plexus_Customer_No
-                WHERE s.Plexus_Customer_No = {PCN}
-                    AND CAST(s.Scrap_Date AS DATE) >= '{req.start_date}'
-                    AND CAST(s.Scrap_Date AS DATE) <= '{req.end_date}'
-                GROUP BY pt.Part_No, pt.Revision, wc.Name
-            """)
-            scrap = {(r[0], r[1], r[2]): float(r[3] or 0) for r in cursor.fetchall()}
-
-            # ── 4. Horas operando / planeadas por Part/Revision/Workcenter ──────────────────
-            cursor.execute(f"""
-                SELECT
-                    pt.Part_No, pt.Revision, wc.Name AS Workcenter,
-                    ISNULL(SUM(CASE WHEN wl.Workcenter_Status_Key = 5448 THEN wl.Log_Hours ELSE 0 END), 0) AS Operating_Hours,
-                    ISNULL(SUM(CASE WHEN wl.Workcenter_Status_Key IN (5448,5445,5449) THEN wl.Log_Hours ELSE 0 END), 0) AS Plan_Hours
-                FROM Part_v_Workcenter_Log AS wl
-                INNER JOIN Part_v_Part AS pt ON wl.Part_Key = pt.Part_Key
-                INNER JOIN Part_v_Workcenter AS wc ON wl.Workcenter_Key = wc.Workcenter_Key
-                WHERE wl.Plexus_Customer_No = {PCN}
-                    AND wl.Log_Date >= '{shift_start}'
-                    AND wl.Log_Date <  '{shift_end}'
-                GROUP BY pt.Part_No, pt.Revision, wc.Name
-            """)
-            operating_hours = {(r[0], r[1], r[2]): (float(r[3] or 0), float(r[4] or 0)) for r in cursor.fetchall()}
-
-        # ── Agregación en Python (equivalente a los CTEs ideal_run_time / avg_ideal_rate /
-        #    all_combinations / oee_calc — el driver ODBC de Plex no soporta CTEs) ──────────
-        good_qty_by_key         = defaultdict(float)
-        ideal_hours_good_by_key = defaultdict(float)
-        for part_no, revision, workcenter, op_key, qty in production_detail:
-            key  = (part_no, revision, workcenter)
-            qty  = float(qty or 0)
-            good_qty_by_key[key] += qty
-            rate = ideal_rate_detail.get((op_key, workcenter))
-            if rate:
-                ideal_hours_good_by_key[key] += qty / rate
-
-        effective_ideal_rate = {
-            key: good_qty_by_key[key] / ideal_hours_good_by_key[key]
-            for key in ideal_hours_good_by_key
-            if ideal_hours_good_by_key[key] > 0
-        }
-
-        all_keys = set(good_qty_by_key) | set(operating_hours)
-
-        details = []
-        totals = {"good_qty": 0.0, "scrap_qty": 0.0, "total_qty": 0.0,
-                  "operating_hours": 0.0, "plan_hours": 0.0, "ideal_hours_total": 0.0}
-
-        for key in all_keys:
-            part_no, revision, workcenter = key
-            good_qty  = good_qty_by_key.get(key, 0.0)
-            scrap_qty = scrap.get(key, 0.0)
-            total_qty = good_qty + scrap_qty
-            op_hrs, plan_hrs = operating_hours.get(key, (0.0, 0.0))
-            eff_rate  = effective_ideal_rate.get(key)
-
-            # Si no hay tasa ideal efectiva para este Part/Workcenter, las horas
-            # ideales totales quedan indefinidas (igual que NULL en el SQL original)
-            # y Performance cae a 0 solo para esta fila.
-            ideal_hours_total = (
-                ideal_hours_good_by_key.get(key, 0.0) + (scrap_qty / eff_rate)
-                if eff_rate else None
-            )
-
-            availability_pct = round(op_hrs * 100.0 / plan_hrs, 2) if plan_hrs > 0 else 0.0
-            performance_pct  = (
-                round(ideal_hours_total * 100.0 / op_hrs, 2)
-                if (ideal_hours_total is not None and op_hrs > 0) else 0.0
-            )
-            quality_pct = round(good_qty * 100.0 / total_qty, 2) if total_qty > 0 else 0.0
-            oee_pct     = round(
-                min((availability_pct / 100) * (performance_pct / 100) * (quality_pct / 100) * 100, 100.0)
-            , 2)
-
-            details.append({
-                "part_workcenter":  f"{part_no} Rev:{revision} - {workcenter}",
-                "good_qty":         good_qty,
-                "scrap_qty":        scrap_qty,
-                "total_qty":        total_qty,
-                "availability_pct": availability_pct,
-                "performance_pct":  performance_pct,
-                "quality_pct":      quality_pct,
-                "oee_pct":          oee_pct,
-            })
-
-            totals["good_qty"]        += good_qty
-            totals["scrap_qty"]       += scrap_qty
-            totals["total_qty"]       += total_qty
-            totals["operating_hours"] += op_hrs
-            totals["plan_hours"]      += plan_hrs
-            if ideal_hours_total is not None:
-                totals["ideal_hours_total"] += ideal_hours_total
-
-        total_availability = round(totals["operating_hours"] * 100.0 / totals["plan_hours"], 2) if totals["plan_hours"] > 0 else 0.0
-        total_performance  = round(totals["ideal_hours_total"] * 100.0 / totals["operating_hours"], 2) if totals["operating_hours"] > 0 else 0.0
-        total_quality      = round(totals["good_qty"] * 100.0 / totals["total_qty"], 2) if totals["total_qty"] > 0 else 0.0
-        total_oee          = round(
-            min((total_availability / 100) * (total_performance / 100) * (total_quality / 100) * 100, 100.0)
-        , 2)
-
-        total = {
-            "part_workcenter":  "TOTAL",
-            "good_qty":         totals["good_qty"],
-            "scrap_qty":        totals["scrap_qty"],
-            "total_qty":        totals["total_qty"],
-            "availability_pct": total_availability,
-            "performance_pct":  total_performance,
-            "quality_pct":      total_quality,
-            "oee_pct":          total_oee,
-        }
-
-        details.sort(key=lambda d: d["part_workcenter"], reverse=True)
-        return {"data": {"details": details, "total": total}}
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
 
 # ─── Scrap Detail (Quality Dashboard) ────────────────────────────────────────
 
@@ -1877,6 +1712,28 @@ def incoming_inspection_history(req: IncomingInspectionHistoryRequest):
             WHERE cc.Plexus_Customer_No = {PCN}
               AND po.Operation_No IN (10, 11, 20)
               AND cc.Change_Date >= '{req.since}'
+        """)
+        data = query_to_list(cursor)
+        conn.close()
+        return {"data": data}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+class UserLookupRequest(BaseModel):
+    user_nos: list[int]
+
+
+@app.post("/user-lookup", dependencies=[Security(verify_token)])
+def user_lookup(req: UserLookupRequest):
+    try:
+        conn = get_connection()
+        cursor = conn.cursor()
+        nos_in_clause = "(" + ", ".join(str(n) for n in req.user_nos) + ")"
+        cursor.execute(f"""
+            SELECT u.Plexus_User_No, u.First_Name, u.Last_Name
+            FROM Plexus_Control_v_Plexus_User_e AS u
+            WHERE u.Plexus_Customer_No = {PCN}
+              AND u.Plexus_User_No IN {nos_in_clause}
         """)
         data = query_to_list(cursor)
         conn.close()
