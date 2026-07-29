@@ -1740,3 +1740,297 @@ def user_lookup(req: UserLookupRequest):
         return {"data": data}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ─── COGP: Cost Model resolution ───────────────────────────────────────────────
+
+@app.get("/cogp/cost-model", dependencies=[Security(verify_token)])
+def cogp_cost_model():
+    """
+    Resuelve el Cost_Model_Key primario vigente. Nunca hardcodear este valor
+    en el consumidor (Django) -- el modelo primario cambia cada año fiscal
+    (confirmado: 5689 "2025 Standards" quedo obsoleto al activarse 5868
+    "2026 Standards" como Primary_Model=1).
+    """
+    try:
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute(f"""
+            SELECT cm.Cost_Model_Key, cm.Cost_Model
+            FROM Part_v_Cost_Model cm
+            WHERE cm.PCN = {PCN}
+              AND cm.Primary_Model = 1
+              AND cm.Active = 1
+        """)
+        rows = cursor.fetchall()
+        conn.close()
+
+        if len(rows) != 1:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Se esperaba exactamente 1 Cost_Model con Primary_Model=1 Active=1, se encontraron {len(rows)}"
+            )
+
+        return {"cost_model_key": rows[0][0], "cost_model_name": rows[0][1]}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ─── COGP: Scrap por Report_Date ───────────────────────────────────────────────
+
+class CogpDateRequest(BaseModel):
+    report_date: str  # YYYY-MM-DD
+
+
+@app.post("/cogp/scrap-by-date", dependencies=[Security(verify_token)])
+def cogp_scrap_by_date(req: CogpDateRequest):
+    try:
+        start = f"{req.report_date} 00:00:00"
+        from datetime import datetime, timedelta
+        end_dt = datetime.strptime(req.report_date, "%Y-%m-%d") + timedelta(days=1)
+        end = end_dt.strftime("%Y-%m-%d %H:%M:%S")
+
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute(f"""
+            SELECT
+                s.Report_Date                 AS Report_Date,
+                s.Scrap_Date                  AS Time_Scrapped,
+                p.Part_No,
+                p.Part_Type,
+                s.Serial_No,
+                s.Quantity,
+                s.Net_Weight                  AS Weight,
+                s.Scrap_Reason,
+                wc.Name                       AS Workcenter,
+                wc.Workcenter_Group,
+                d.Name                        AS Department,
+                s.Unit_Cost,
+                s.Extended_Cost,
+                s.Note
+            FROM Part_v_Scrap s
+            INNER JOIN Part_v_Workcenter wc
+                ON s.Workcenter_Key = wc.Workcenter_Key
+                AND s.Plexus_Customer_No = wc.Plexus_Customer_No
+            INNER JOIN Part_v_Part_e p
+                ON s.Part_Key = p.Part_Key
+            LEFT JOIN Common_v_Department d
+                ON wc.Department_No = d.Department_No
+            WHERE s.Plexus_Customer_No = {PCN}
+              AND s.Report_Date >= '{start}'
+              AND s.Report_Date <  '{end}'
+            ORDER BY wc.Name, s.Scrap_Date
+        """)
+        raw = query_to_list(cursor)
+        conn.close()
+
+        data = []
+        for row in raw:
+            rd = datetime.fromisoformat(row["Report_Date"])
+            row["Report_Date"] = (rd + timedelta(hours=3)).date().isoformat()
+            data.append(row)
+
+        return {"data": data}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ─── COGP: Producción por Report_Date (SIN filtro de workcenter) ──────────────
+
+class CogpProductionRequest(BaseModel):
+    report_date: str    # YYYY-MM-DD
+    cost_model_key: int  # resuelto previamente via /cogp/cost-model
+
+
+# Workcenters terminales confirmados contra el reporte nativo de Plex COGP
+# (sesión 2026-07-28) -- Frontal 2/Final 3/Frontal 3/Soldadura de Siphon son
+# operaciones intermedias y NO deben contarse como produccion terminada.
+COGP_TERMINAL_WORKCENTERS = ('HM Ensamble Final 2', 'HM Ensamble de Servicio', 'TULC Ensamble Final')
+WC_LIST_COGP = "', '".join(COGP_TERMINAL_WORKCENTERS)
+
+@app.post("/cogp/production-by-date", dependencies=[Security(verify_token)])
+def cogp_production_by_date(req: CogpProductionRequest):
+    try:
+        start = f"{req.report_date} 00:00:00"
+        from datetime import datetime, timedelta
+        end_dt = datetime.strptime(req.report_date, "%Y-%m-%d") + timedelta(days=1)
+        end = end_dt.strftime("%Y-%m-%d %H:%M:%S")
+
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute(f"""
+            SELECT
+                wc.Name       AS Workcenter,
+                p.Part_No,
+                SUM(pe.Quantity) AS Quantity,
+                ROUND(SUM(pe.Quantity * ISNULL(pc.Cost, 0)), 2) AS Extended_Cost
+            FROM Part_v_Production_e pe
+            LEFT JOIN Part_v_Part_e p
+                ON pe.Part_Key = p.Part_Key
+                AND p.Plexus_Customer_No = {PCN}
+            LEFT JOIN Part_v_Workcenter wc
+                ON pe.Workcenter_Key = wc.Workcenter_Key
+                AND wc.Plexus_Customer_No = {PCN}
+            LEFT JOIN Part_v_Part_Cost pc
+                ON pe.Part_Key = pc.Part_Key
+                AND pc.PCN = {PCN}
+                AND pc.Cost_Model_Key = {req.cost_model_key}
+            WHERE pe.Plexus_Customer_No = {PCN}
+              AND pe.Report_Date >= '{start}'
+              AND pe.Report_Date <  '{end}'
+              AND wc.Name IN ('{WC_LIST_COGP}')
+            GROUP BY wc.Name, p.Part_No
+        """)
+        data = query_to_list(cursor)
+        conn.close()
+        return {"data": data}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ─── COGP: Customer/Part mapping (para sync de CustomerPartMapping) ───────────
+
+@app.get("/cogp/customer-part-mapping", dependencies=[Security(verify_token)])
+def cogp_customer_part_mapping():
+    try:
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute(f"""
+            SELECT
+                p.Part_No,
+                p.Name         AS Part_Name,
+                p.Part_Status,
+                cp.Customer_No,
+                c.Name         AS Customer_Name,
+                cp.Customer_Part_No
+            FROM Part_v_Part AS p
+            LEFT JOIN Part_v_Customer_Part AS cp
+                ON p.Part_Key = cp.Part_Key
+               AND p.Plexus_Customer_No = cp.Plexus_Customer_No
+            LEFT JOIN Common_v_Customer AS c
+                ON cp.Customer_No = c.Customer_No
+               AND cp.Plexus_Customer_No = c.Plexus_Customer_No
+            WHERE p.Plexus_Customer_No = {PCN}
+              AND p.Part_Status = 'Active'
+            ORDER BY p.Part_No
+        """)
+        data = query_to_list(cursor)
+        conn.close()
+        return {"data": data}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ─── COGP: Scrap por rango (agregado, sin loop) ────────────────────────────────
+
+class CogpRangeRequest(BaseModel):
+    start_date: str  # YYYY-MM-DD
+    end_date:   str  # YYYY-MM-DD (inclusive)
+
+
+@app.post("/cogp/scrap-range", dependencies=[Security(verify_token)])
+def cogp_scrap_range(req: CogpRangeRequest):
+    try:
+        from datetime import datetime, timedelta
+
+        start_dt = datetime.strptime(req.start_date, "%Y-%m-%d")
+        end_dt   = datetime.strptime(req.end_date,   "%Y-%m-%d")
+        if (end_dt - start_dt).days > 180:
+            raise HTTPException(status_code=400, detail="Rango maximo 180 dias.")
+
+        start = f"{req.start_date} 00:00:00"
+        end   = (end_dt + timedelta(days=1)).strftime("%Y-%m-%d %H:%M:%S")
+
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute(f"""
+            SELECT
+                s.Report_Date                AS Report_Date,
+                wc.Workcenter_Group          AS Workcenter_Group,
+                wc.Name                      AS Workcenter,
+                s.Extended_Cost              AS Extended_Cost
+            FROM Part_v_Scrap s
+            INNER JOIN Part_v_Workcenter wc
+                ON s.Workcenter_Key = wc.Workcenter_Key
+                AND s.Plexus_Customer_No = wc.Plexus_Customer_No
+            WHERE s.Plexus_Customer_No = {PCN}
+              AND s.Report_Date >= '{start}'
+              AND s.Report_Date <  '{end}'
+              AND wc.Workcenter_Group IN ('Heater Module', 'TULC')
+        """)
+        raw = query_to_list(cursor)
+        conn.close()
+
+        # Report_Date viene con hora servidor codificada (offset +3h vs.
+        # Pacific) -- confirmado sesion 2026-07-29: Report_Date crudo
+        # 'Jul 05 21:00' corresponde al Report Date '7/6' del reporte
+        # nativo de Plex. Normalizar sumando el offset antes de exponer
+        # la fecha, para que .date() en el consumidor de por resultado
+        # el mismo dia operativo que Plex reporta.
+        data = []
+        for row in raw:
+            rd = datetime.fromisoformat(row["Report_Date"])
+            row["Report_Date"] = (rd + timedelta(hours=3)).date().isoformat()
+            data.append(row)
+
+        return {"data": data}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ─── COGP: Produccion por rango (agregado, sin loop) ───────────────────────────
+
+class CogpProductionRangeRequest(BaseModel):
+    start_date: str
+    end_date:   str
+    cost_model_key: int
+
+
+@app.post("/cogp/production-range", dependencies=[Security(verify_token)])
+def cogp_production_range(req: CogpProductionRangeRequest):
+    try:
+        from datetime import datetime, timedelta
+
+        start_dt = datetime.strptime(req.start_date, "%Y-%m-%d")
+        end_dt   = datetime.strptime(req.end_date,   "%Y-%m-%d")
+        if (end_dt - start_dt).days > 180:
+            raise HTTPException(status_code=400, detail="Rango maximo 180 dias.")
+
+        start = f"{req.start_date} 00:00:00"
+        end   = (end_dt + timedelta(days=1)).strftime("%Y-%m-%d %H:%M:%S")
+
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute(f"""
+            SELECT
+                pe.Report_Date AS Report_Date,
+                wc.Name        AS Workcenter,
+                SUM(pe.Quantity * ISNULL(pc.Cost, 0)) AS Extended_Cost
+            FROM Part_v_Production_e pe
+            LEFT JOIN Part_v_Workcenter wc
+                ON pe.Workcenter_Key = wc.Workcenter_Key
+                AND wc.Plexus_Customer_No = {PCN}
+            LEFT JOIN Part_v_Part_Cost pc
+                ON pe.Part_Key = pc.Part_Key
+                AND pc.PCN = {PCN}
+                AND pc.Cost_Model_Key = {req.cost_model_key}
+            WHERE pe.Plexus_Customer_No = {PCN}
+              AND pe.Report_Date >= '{start}'
+              AND pe.Report_Date <  '{end}'
+              AND wc.Name IN ('{WC_LIST_COGP}')
+            GROUP BY pe.Report_Date, wc.Name
+        """)
+        raw = query_to_list(cursor)
+        conn.close()
+
+        data = []
+        for row in raw:
+            rd = datetime.fromisoformat(row["Report_Date"])
+            row["Report_Date"] = (rd + timedelta(hours=3)).date().isoformat()
+            data.append(row)
+
+        return {"data": data}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
