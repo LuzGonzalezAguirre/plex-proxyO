@@ -1947,6 +1947,7 @@ def cogp_scrap_range(req: CogpRangeRequest):
                 s.Report_Date                AS Report_Date,
                 wc.Workcenter_Group          AS Workcenter_Group,
                 wc.Name                      AS Workcenter,
+                s.Scrap_Reason                AS Scrap_Reason,
                 s.Extended_Cost              AS Extended_Cost
             FROM Part_v_Scrap s
             INNER JOIN Part_v_Workcenter wc
@@ -1960,12 +1961,6 @@ def cogp_scrap_range(req: CogpRangeRequest):
         raw = query_to_list(cursor)
         conn.close()
 
-        # Report_Date viene con hora servidor codificada (offset +3h vs.
-        # Pacific) -- confirmado sesion 2026-07-29: Report_Date crudo
-        # 'Jul 05 21:00' corresponde al Report Date '7/6' del reporte
-        # nativo de Plex. Normalizar sumando el offset antes de exponer
-        # la fecha, para que .date() en el consumidor de por resultado
-        # el mismo dia operativo que Plex reporta.
         data = []
         for row in raw:
             rd = datetime.fromisoformat(row["Report_Date"])
@@ -1977,7 +1972,6 @@ def cogp_scrap_range(req: CogpRangeRequest):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
 # ─── COGP: Produccion por rango (agregado, sin loop) ───────────────────────────
 
 class CogpProductionRangeRequest(BaseModel):
