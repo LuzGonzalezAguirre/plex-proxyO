@@ -1943,11 +1943,12 @@ def cogp_scrap_range(req: CogpRangeRequest):
         conn = get_connection()
         cursor = conn.cursor()
         cursor.execute(f"""
-            SELECT
+             SELECT
                 s.Report_Date                AS Report_Date,
                 wc.Workcenter_Group          AS Workcenter_Group,
                 wc.Name                      AS Workcenter,
                 s.Scrap_Reason                AS Scrap_Reason,
+                s.Quantity                   AS Quantity,
                 s.Extended_Cost              AS Extended_Cost
             FROM Part_v_Scrap s
             INNER JOIN Part_v_Workcenter wc
@@ -1996,9 +1997,10 @@ def cogp_production_range(req: CogpProductionRangeRequest):
         conn = get_connection()
         cursor = conn.cursor()
         cursor.execute(f"""
-            SELECT
+           SELECT
                 pe.Report_Date AS Report_Date,
                 wc.Name        AS Workcenter,
+                SUM(pe.Quantity)                      AS Quantity,
                 SUM(pe.Quantity * ISNULL(pc.Cost, 0)) AS Extended_Cost
             FROM Part_v_Production_e pe
             LEFT JOIN Part_v_Workcenter wc
@@ -2026,5 +2028,27 @@ def cogp_production_range(req: CogpProductionRangeRequest):
         return {"data": data}
     except HTTPException:
         raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ─── Workcenters (catálogo para Downtime Settings) ────────────────────────────
+
+@app.get("/workcenters", dependencies=[Security(verify_token)])
+def workcenters():
+    try:
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute(f"""
+            SELECT DISTINCT
+                wc.Name AS Workcenter,
+                wc.Workcenter_Group
+            FROM Part_v_Workcenter wc
+            WHERE wc.Plexus_Customer_No = {PCN}
+              AND wc.Workcenter_Group IN ('Heater Module', 'TULC')
+            ORDER BY wc.Name
+        """)
+        data = query_to_list(cursor)
+        conn.close()
+        return {"data": data}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
