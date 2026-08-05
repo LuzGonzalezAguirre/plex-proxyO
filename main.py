@@ -1186,15 +1186,45 @@ def maintenance_downtime_by_month(req: MaintenanceKPIRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+WR_DATE_FIELDS = {
+    "Request_Date":   "wr.Request_Date",
+    "Due_Date":       "wr.Due_Date",
+    "Completed_Date": "wr.Completed_Date",
+}
+
+
 class WorkRequestsRequest(BaseModel):
-    start_date: str  # YYYY-MM-DD
-    end_date:   str  # YYYY-MM-DD (inclusive)
+    start_date: str                                  # YYYY-MM-DD
+    end_date:   str                                  # YYYY-MM-DD (inclusive)
+    work_request_type_key: Optional[int] = None      # None = todos los tipos
+    date_field: str = "Request_Date"                 # columna que filtra el rango
 
 
 @app.post("/work-requests", dependencies=[Security(verify_token)])
 def work_requests(req: WorkRequestsRequest):
     try:
+        from datetime import datetime
+
+        date_col = WR_DATE_FIELDS.get(req.date_field)
+        if date_col is None:
+            raise HTTPException(
+                status_code=400,
+                detail=f"date_field invalido. Validos: {sorted(WR_DATE_FIELDS)}",
+            )
+
+        start_dt = datetime.strptime(req.start_date, "%Y-%m-%d")
+        end_dt   = datetime.strptime(req.end_date,   "%Y-%m-%d")
+        if end_dt < start_dt:
+            raise HTTPException(status_code=400, detail="end_date anterior a start_date.")
+        if (end_dt - start_dt).days > 400:
+            raise HTTPException(status_code=400, detail="Rango maximo 400 dias.")
+
         end_inclusive = f"{req.end_date} 23:59:59"
+
+        type_clause = ""
+        if req.work_request_type_key is not None:
+            type_clause = f"AND wr.Work_Request_Type_Key = {int(req.work_request_type_key)}"
+
         conn   = get_connection()
         cursor = conn.cursor()
         cursor.execute(f"""
@@ -1208,22 +1238,24 @@ def work_requests(req: WorkRequestsRequest):
                 wt.Work_Request_Type,
                 u.First_Name + ' ' + u.Last_Name AS Assigned_To,
                 eq.Equipment_ID,
-                eq.Description  AS Equipment_Description,
+                eq.Description      AS Equipment_Description,
                 eq.Equipment_Group,
-                wc.Name         AS Workcenter,
-                d.Name          AS Department_Name,
+                wc.Name             AS Workcenter,
+                wc.Workcenter_Group AS Workcenter_Group,
+                d.Name              AS Department_Name,
                 ROUND(ISNULL(wr.Scheduled_Hours, 0), 2)  AS Scheduled_Hours,
                 ROUND(ISNULL(el.Duration, 0), 2)         AS Maintenance_Hours,
                 f.Failure,
                 ft.Failure_Type,
                 fa.Failure_Action
             FROM Maintenance_v_Work_Request AS wr
+            INNER JOIN Maintenance_v_Work_Request_Type AS wt
+                ON wr.Work_Request_Type_Key = wt.Work_Request_Type_Key
             LEFT JOIN Plexus_Control_v_Plexus_User_e AS u
-                ON wr.Assigned_To = u.Plexus_User_No
+                ON wr.Assigned_To          = u.Plexus_User_No
+               AND wr.Plexus_Customer_No   = u.Plexus_Customer_No
             LEFT JOIN Maintenance_v_Work_Request_Status AS ws
                 ON wr.Work_Request_Status_Key = ws.Work_Request_Status_Key
-            LEFT JOIN Maintenance_v_Work_Request_Type AS wt
-                ON wr.Work_Request_Type_Key = wt.Work_Request_Type_Key
             LEFT JOIN Maintenance_v_Work_Request_Failure AS wrf
                 ON wr.Work_Request_Key = wrf.Work_Request_Key
             LEFT JOIN Maintenance_v_Failure AS f
@@ -1233,9 +1265,11 @@ def work_requests(req: WorkRequestsRequest):
             LEFT JOIN Maintenance_v_Failure_Action AS fa
                 ON wrf.Failure_Action_Key = fa.Failure_Action_Key
             LEFT JOIN Maintenance_v_Equipment AS eq
-                ON wr.Equipment_Key = eq.Equipment_Key
+                ON wr.Equipment_Key        = eq.Equipment_Key
+               AND wr.Plexus_Customer_No   = eq.Plexus_Customer_No
             LEFT JOIN Part_v_Workcenter AS wc
-                ON wr.Workcenter_Key = wc.Workcenter_Key
+                ON wr.Workcenter_Key       = wc.Workcenter_Key
+               AND wr.Plexus_Customer_No   = wc.Plexus_Customer_No
             LEFT JOIN Common_v_Department AS d
                 ON wc.Department_No = d.Department_No
             LEFT JOIN (
@@ -1245,35 +1279,60 @@ def work_requests(req: WorkRequestsRequest):
             ) AS el
                 ON wr.Work_Request_Key = el.Work_Request_Key
             WHERE wr.Plexus_Customer_No = {PCN}
-              AND wr.Request_Date >= '{req.start_date}'
-              AND wr.Request_Date <= '{end_inclusive}'
+              AND {date_col} >= '{req.start_date}'
+              AND {date_col} <= '{end_inclusive}'
+              {type_clause}
         """)
         rows = query_to_list(cursor)
         conn.close()
 
-        result = []
+        # Colapsa el fan-out de Work_Request_Failure: una entrada por WR,
+        # con las fallas distintas acumuladas en una lista. Los campos planos
+        # failure/failure_type/failure_action conservan la primera falla para
+        # no romper el contrato del dashboard existente.
+        merged: dict = {}
         for r in rows:
-            result.append({
-                "work_request_no":       r["Work_Request_No"],
-                "description":           r["Description"] or "",
-                "request_date":          r["Request_Date"].isoformat() if hasattr(r["Request_Date"], "isoformat") else str(r["Request_Date"] or ""),
-                "due_date":              r["Due_Date"].isoformat() if hasattr(r["Due_Date"], "isoformat") else str(r["Due_Date"] or ""),
-                "completed_date":        r["Completed_Date"].isoformat() if r["Completed_Date"] and hasattr(r["Completed_Date"], "isoformat") else None,
-                "status":                r["Work_Request_Status"] or "Unknown",
-                "type":                  r["Work_Request_Type"]   or "Unknown",
-                "assigned_to":           r["Assigned_To"]         or "Unassigned",
-                "equipment_id":          r["Equipment_ID"]        or "",
-                "equipment_description": r["Equipment_Description"] or "",
-                "equipment_group":       r["Equipment_Group"]     or "Other",
-                "workcenter":            r["Workcenter"]          or "",
-                "department":            r["Department_Name"]     or "Unknown",
-                "scheduled_hours":       float(r["Scheduled_Hours"]   or 0),
-                "maintenance_hours":     float(r["Maintenance_Hours"] or 0),
-                "failure":               r["Failure"]             or "",
-                "failure_type":          r["Failure_Type"]        or "",
-                "failure_action":        r["Failure_Action"]      or "",
-            })
+            no = r["Work_Request_No"]
+            if no not in merged:
+                merged[no] = {
+                    "work_request_no":       no,
+                    "description":           r["Description"] or "",
+                    "request_date":          str(r["Request_Date"]   or ""),
+                    "due_date":              str(r["Due_Date"]       or ""),
+                    "completed_date":        str(r["Completed_Date"]) if r["Completed_Date"] else None,
+                    "status":                r["Work_Request_Status"]    or "Unknown",
+                    "type":                  r["Work_Request_Type"]      or "Unknown",
+                    "assigned_to":           r["Assigned_To"]            or "Unassigned",
+                    "equipment_id":          r["Equipment_ID"]           or "",
+                    "equipment_description": r["Equipment_Description"]  or "",
+                    "equipment_group":       r["Equipment_Group"]        or "Other",
+                    "workcenter":            r["Workcenter"]             or "",
+                    "workcenter_group":      r["Workcenter_Group"]       or "",
+                    "department":            r["Department_Name"]        or "Unknown",
+                    "scheduled_hours":       float(r["Scheduled_Hours"]   or 0),
+                    "maintenance_hours":     float(r["Maintenance_Hours"] or 0),
+                    "failures":              [],
+                }
+            failure = {
+                "failure":        r["Failure"]        or "",
+                "failure_type":   r["Failure_Type"]   or "",
+                "failure_action": r["Failure_Action"] or "",
+            }
+            if any(failure.values()) and failure not in merged[no]["failures"]:
+                merged[no]["failures"].append(failure)
+
+        result = []
+        for item in merged.values():
+            first = item["failures"][0] if item["failures"] else {}
+            item["failure"]        = first.get("failure",        "")
+            item["failure_type"]   = first.get("failure_type",   "")
+            item["failure_action"] = first.get("failure_action", "")
+            result.append(item)
+
         return {"data": result}
+
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
