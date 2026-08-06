@@ -2098,13 +2098,12 @@ def workcenters():
         conn = get_connection()
         cursor = conn.cursor()
         cursor.execute(f"""
-            SELECT DISTINCT
-                wc.Name AS Workcenter,
-                wc.Workcenter_Group
-            FROM Part_v_Workcenter wc
-            WHERE wc.Plexus_Customer_No = {PCN}
-              AND wc.Workcenter_Group IN ('Heater Module', 'TULC')
-            ORDER BY wc.Name
+            SELECT wc.Workcenter_Code   AS Workcenter,
+                wc.Workcenter_Group  AS Workcenter_Group,
+                wc.Active            AS Active
+            FROM   Part_v_Workcenter AS wc
+            WHERE  wc.Plexus_Customer_No = 306713
+            ORDER BY wc.Workcenter_Group, wc.Workcenter_Code
         """)
         data = query_to_list(cursor)
         conn.close()
