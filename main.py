@@ -970,6 +970,8 @@ def production_range(req: ProductionRangeRequest):
 
 # ─── Maintenance KPIs ─────────────────────────────────────────────────────────
 
+# ─── Maintenance KPIs ─────────────────────────────────────────────────────────
+
 class MaintenanceKPIRequest(BaseModel):
     start_date: str  # YYYY-MM-DD
     end_date:   str  # YYYY-MM-DD (exclusive)
@@ -985,7 +987,9 @@ def maintenance_kpis(req: MaintenanceKPIRequest):
             SELECT
                 ROUND(SUM(CASE WHEN wl.Workcenter_Status_Key = 5448 THEN wl.Log_Hours ELSE 0 END), 2) AS Operating_Hours,
                 ROUND(SUM(CASE WHEN wl.Workcenter_Status_Key IN (5445, 5449) THEN wl.Log_Hours ELSE 0 END), 2) AS Downtime_Hours,
-                ROUND(SUM(CASE WHEN wl.Workcenter_Status_Key = 5445 THEN wl.Log_Hours ELSE 0 END), 2) AS Down_Hours,
+                ROUND(SUM(CASE WHEN wl.Workcenter_Status_Key = 5445
+                                    AND ISNULL(we.Description, '') <> 'Quality'
+                               THEN wl.Log_Hours ELSE 0 END), 2) AS Down_Hours,
                 ROUND(SUM(CASE WHEN wl.Workcenter_Status_Key = 5449 THEN wl.Log_Hours ELSE 0 END), 2) AS Setup_Hours,
                 ROUND(SUM(CASE WHEN wl.Workcenter_Status_Key = 5446 THEN wl.Log_Hours ELSE 0 END), 2) AS Idle_Hours,
                 SUM(CASE WHEN wl.Workcenter_Status_Key = 5445 THEN 1 ELSE 0 END) AS Total_Failures,
@@ -1004,6 +1008,9 @@ def maintenance_kpis(req: MaintenanceKPIRequest):
                     , 0)
                 , 2) AS Availability_Pct
             FROM Part_v_Workcenter_Log wl
+            LEFT JOIN Part_v_Workcenter_Event we
+                ON wl.Workcenter_Event_Key = we.Workcenter_Event_Key
+                AND wl.Plexus_Customer_No = we.Plexus_Customer_No
             WHERE wl.Plexus_Customer_No = {PCN}
               AND wl.Log_Date >= '{shift_start}'
               AND wl.Log_Date <  '{shift_end}'
