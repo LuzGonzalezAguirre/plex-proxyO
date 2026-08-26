@@ -554,9 +554,34 @@ TULC_WORKCENTERS = {"TULC Ensamble Final"}
 VOLVO_PARTS       = {"43301", "43302", "43303", "43304", "43305", "43306", "43291", "45294"}
 VOLVO_WORKCENTERS = {"HM Ensamble Final 2"}
 CUMMINS_WORKCENTERS = {"HM Ensamble Final 3", "HM Ensamble Frontal 3"}
-ALL_PROD_WORKCENTERS = VOLVO_WORKCENTERS | CUMMINS_WORKCENTERS | TULC_WORKCENTERS
+JOHN_DEERE_WORKCENTERS = {"Velocidad Prueba Final"}
+EATON_WORKCENTERS = {"Velocidad - Prueba Final", "Velocidad - Prueba Final 2"}
+
+ALL_PROD_WORKCENTERS = (
+    VOLVO_WORKCENTERS | CUMMINS_WORKCENTERS | TULC_WORKCENTERS
+    | JOHN_DEERE_WORKCENTERS | EATON_WORKCENTERS
+)
 WC_LIST = "', '".join(ALL_PROD_WORKCENTERS)
 
+BU_KEYS = ("volvo", "cummins", "tulc", "john_deere", "eaton")
+
+def classify_bu(wc_name: str, part_no: str) -> str:
+    """
+    Clasificacion compartida por /daily-production, /yield-by-client y
+    /production-range. TULC/John Deere/Eaton se resuelven por workcenter
+    (terminales exclusivos, sin ambiguedad). Volvo se distingue por
+    Part_No dentro de Heater Module; Cummins es el catch-all historico
+    de ese mismo grupo.
+    """
+    if wc_name in TULC_WORKCENTERS:
+        return "tulc"
+    if wc_name in JOHN_DEERE_WORKCENTERS:
+        return "john_deere"
+    if wc_name in EATON_WORKCENTERS:
+        return "eaton"
+    if part_no in VOLVO_PARTS:
+        return "volvo"
+    return "cummins"
 
 class DailyProductionRequest(BaseModel):
     report_date: str  # YYYY-MM-DD
@@ -596,38 +621,21 @@ def daily_production(req: DailyProductionRequest):
         rows = query_to_list(cursor)
         conn.close()
 
-        volvo_qty    = 0
-        cummins_qty  = 0
-        tulc_qty     = 0
-        volvo_cost   = 0.0
-        cummins_cost = 0.0
-        tulc_cost    = 0.0
+        result = {bu: {"quantity": 0, "cogp_cost": 0.0} for bu in BU_KEYS}
 
         for row in rows:
             part_no = str(row["Part_No"]  or "").strip().split(".")[0]
             wc_name = str(row["Workcenter"] or "")
             qty     = float(row["Quantity"]      or 0)
             cost    = float(row["Extended_Cost"] or 0)
+            bu = classify_bu(wc_name, part_no)
+            result[bu]["quantity"]  += int(qty)
+            result[bu]["cogp_cost"]  = round(result[bu]["cogp_cost"] + cost, 2)
 
-            if wc_name in TULC_WORKCENTERS:
-                tulc_qty  += qty
-                tulc_cost += cost
-            elif part_no in VOLVO_PARTS:
-                volvo_qty  += qty
-                volvo_cost += cost
-            else:
-                cummins_qty  += qty
-                cummins_cost += cost
-
-        return {
-            "date":    req.report_date,
-            "volvo":   {"quantity": int(volvo_qty),   "cogp_cost": round(volvo_cost,   2)},
-            "cummins": {"quantity": int(cummins_qty), "cogp_cost": round(cummins_cost, 2)},
-            "tulc":    {"quantity": int(tulc_qty),    "cogp_cost": round(tulc_cost,    2)},
-        }
+        return {"date": req.report_date, **result}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
+    
 # ─── Scrap COGP % ─────────────────────────────────────────────────────────────
 
 @app.post("/scrap-cogp", dependencies=[Security(verify_token)])
@@ -750,25 +758,31 @@ def yield_by_client(req: DailyProductionRequest):
         cursor = conn.cursor()
 
         cursor.execute(f"""
-            SELECT wc.Name AS Workcenter, SUM(pe.Quantity) AS Quantity
+            SELECT wc.Name AS Workcenter, p.Part_No AS Part_No, SUM(pe.Quantity) AS Quantity
             FROM Part_v_Production_e pe
             INNER JOIN Part_v_Workcenter wc
                 ON pe.Workcenter_Key       = wc.Workcenter_Key
                 AND pe.Plexus_Customer_No  = wc.Plexus_Customer_No
+            LEFT JOIN Part_v_Part_e p
+                ON pe.Part_Key = p.Part_Key
+                AND p.Plexus_Customer_No = {PCN}
             WHERE pe.Plexus_Customer_No = {PCN}
               AND pe.Record_Date >= '{shift_start}'
               AND pe.Record_Date <  '{shift_end}'
               AND wc.Name IN ('{WC_LIST}')
-            GROUP BY wc.Name
+            GROUP BY wc.Name, p.Part_No
         """)
         prod_rows = query_to_list(cursor)
 
         cursor.execute(f"""
-            SELECT wc.Name AS Workcenter, SUM(s.Quantity) AS Scrap_Qty
+            SELECT wc.Name AS Workcenter, p.Part_No AS Part_No, SUM(s.Quantity) AS Scrap_Qty
             FROM Part_v_Scrap s
             INNER JOIN Part_v_Workcenter wc
                 ON s.Workcenter_Key       = wc.Workcenter_Key
                 AND s.Plexus_Customer_No  = wc.Plexus_Customer_No
+            LEFT JOIN Part_v_Part_e p
+                ON s.Part_Key = p.Part_Key
+                AND p.Plexus_Customer_No = {PCN}
             WHERE s.Plexus_Customer_No = {PCN}
               AND s.Scrap_Date >= '{shift_start}'
               AND s.Scrap_Date <  '{shift_end}'
@@ -780,45 +794,35 @@ def yield_by_client(req: DailyProductionRequest):
                     AND pe.Record_Date >= '{shift_start}'
                     AND pe.Record_Date <  '{shift_end}'
               )
-            GROUP BY wc.Name
+            GROUP BY wc.Name, p.Part_No
         """)
         scrap_rows = query_to_list(cursor)
         conn.close()
 
-        result = {
-            "volvo":   {"production": 0, "scrap": 0, "yield_pct": 100.0},
-            "cummins": {"production": 0, "scrap": 0, "yield_pct": 100.0},
-            "tulc":    {"production": 0, "scrap": 0, "yield_pct": 100.0},
-            "total":   {"production": 0, "scrap": 0, "yield_pct": 100.0},
-        }
+        result = {bu: {"production": 0, "scrap": 0, "yield_pct": 100.0} for bu in BU_KEYS}
+        result["total"] = {"production": 0, "scrap": 0, "yield_pct": 100.0}
 
         for row in prod_rows:
             wc_name = row["Workcenter"] or ""
+            part_no = str(row["Part_No"] or "").strip().split(".")[0]
             qty     = int(float(row["Quantity"] or 0))
-            if wc_name in VOLVO_WORKCENTERS:
-                result["volvo"]["production"]   += qty
-            elif wc_name in CUMMINS_WORKCENTERS:
-                result["cummins"]["production"] += qty
-            elif wc_name in TULC_WORKCENTERS:
-                result["tulc"]["production"]    += qty
+            bu = classify_bu(wc_name, part_no)
+            result[bu]["production"] += qty
             result["total"]["production"] += qty
 
         for row in scrap_rows:
             wc_name = row["Workcenter"] or ""
+            part_no = str(row["Part_No"] or "").strip().split(".")[0]
             qty     = int(float(row["Scrap_Qty"] or 0))
-            if wc_name in VOLVO_WORKCENTERS:
-                result["volvo"]["scrap"]   += qty
-            elif wc_name in CUMMINS_WORKCENTERS:
-                result["cummins"]["scrap"] += qty
-            elif wc_name in TULC_WORKCENTERS:
-                result["tulc"]["scrap"]    += qty
+            bu = classify_bu(wc_name, part_no)
+            result[bu]["scrap"] += qty
             result["total"]["scrap"] += qty
 
-        for client in ["volvo", "cummins", "tulc", "total"]:
-            prod  = result[client]["production"]
-            scrap = result[client]["scrap"]
+        for bu in (*BU_KEYS, "total"):
+            prod  = result[bu]["production"]
+            scrap = result[bu]["scrap"]
             total = prod + scrap
-            result[client]["yield_pct"] = round((prod / total * 100), 2) if total > 0 else 100.0
+            result[bu]["yield_pct"] = round((prod / total * 100), 2) if total > 0 else 100.0
 
         return {"date": req.report_date, **result}
 
@@ -860,104 +864,36 @@ def production_range(req: ProductionRangeRequest):
             date_str               = current.strftime("%Y-%m-%d")
             shift_start, shift_end = get_shift_range(date_str)
 
-            # ── Producción ────────────────────────────────────────────────────
             cursor.execute(f"""
                 SELECT
                     wc.Name          AS Workcenter,
+                    p.Part_No        AS Part_No,
                     SUM(pe.Quantity) AS Quantity
                 FROM Part_v_Production_e AS pe
                     INNER JOIN Part_v_Workcenter AS wc
                         ON pe.Workcenter_Key      = wc.Workcenter_Key
                         AND pe.Plexus_Customer_No = wc.Plexus_Customer_No
+                    LEFT JOIN Part_v_Part_e AS p
+                        ON pe.Part_Key = p.Part_Key
+                        AND p.Plexus_Customer_No = {PCN}
                 WHERE pe.Record_Date       >= '{shift_start}'
                   AND pe.Record_Date        < '{shift_end}'
                   AND pe.Plexus_Customer_No = {PCN}
                   AND wc.Name IN ('{WC_LIST}')
-                GROUP BY wc.Name
+                GROUP BY wc.Name, p.Part_No
             """)
             prod_rows = query_to_list(cursor)
 
-            # ── Scrap (solo producto terminado) ───────────────────────────────
-            cursor.execute(f"""
-                SELECT
-                    wc.Name                        AS Workcenter_Name,
-                    ROUND(SUM(s.Quantity),      0) AS Scrap_Qty,
-                    ROUND(SUM(s.Extended_Cost), 2) AS Scrap_Cost
-                FROM Part_v_Scrap s
-                    INNER JOIN Part_v_Workcenter wc
-                        ON s.Workcenter_Key      = wc.Workcenter_Key
-                        AND s.Plexus_Customer_No = wc.Plexus_Customer_No
-                    INNER JOIN Part_v_Part_e p
-                        ON s.Part_Key = p.Part_Key
-                WHERE s.Plexus_Customer_No = {PCN}
-                  AND s.Scrap_Date >= '{shift_start}'
-                  AND s.Scrap_Date <  '{shift_end}'
-                  AND wc.Name IN ('{WC_LIST}')
-                  AND LEFT(LTRIM(p.Part_No), 5) IN (
-                      '43301','43302','43303','43304','43305',
-                      '43306','43291','45294','43400','43413','43422'
-                  )
-                GROUP BY wc.Name
-            """)
-            scrap_rows = query_to_list(cursor)
-
-            # ── Clasificar ────────────────────────────────────────────────────
-            volvo_qty      = 0
-            cummins_qty    = 0
-            volvo_scrap_qty    = 0
-            cummins_scrap_qty  = 0
-            volvo_scrap_cost   = 0.0
-            cummins_scrap_cost = 0.0
-            tulc_qty       = 0
-            tulc_scrap_qty = 0
-            tulc_scrap_cost = 0.0
+            day_result = {bu: {"quantity": 0, "cogp_cost": 0.0, "scrap_qty": 0, "scrap_cost": 0.0} for bu in BU_KEYS}
 
             for row in prod_rows:
-                wc  = row["Workcenter"] or ""
-                qty = float(row["Quantity"] or 0)
-                if wc in VOLVO_WORKCENTERS:
-                    volvo_qty   += qty
-                elif wc in TULC_WORKCENTERS:
-                    tulc_qty += qty
-                elif wc in CUMMINS_WORKCENTERS:
-                    cummins_qty += qty
+                wc_name = row["Workcenter"] or ""
+                part_no = str(row["Part_No"] or "").strip().split(".")[0]
+                qty     = float(row["Quantity"] or 0)
+                bu = classify_bu(wc_name, part_no)
+                day_result[bu]["quantity"] += int(qty)
 
-            for row in scrap_rows:
-                wc   = row["Workcenter_Name"] or ""
-                qty  = float(row["Scrap_Qty"]  or 0)
-                cost = float(row["Scrap_Cost"] or 0)
-                if wc in VOLVO_WORKCENTERS:
-                    volvo_scrap_qty  += int(qty)
-                    volvo_scrap_cost += cost
-                elif wc in TULC_WORKCENTERS:
-                    tulc_scrap_qty  += int(qty)
-                    tulc_scrap_cost += cost
-                elif wc in CUMMINS_WORKCENTERS:
-                    cummins_scrap_qty  += int(qty)
-                    cummins_scrap_cost += cost
-
-            results.append({
-                "date": date_str,
-                "volvo": {
-                    "quantity":   int(volvo_qty),
-                    "cogp_cost":  0.0,
-                    "scrap_qty":  volvo_scrap_qty,
-                    "scrap_cost": round(volvo_scrap_cost, 2),
-                },
-                "cummins": {
-                    "quantity":   int(cummins_qty),
-                    "cogp_cost":  0.0,
-                    "scrap_qty":  cummins_scrap_qty,
-                    "scrap_cost": round(cummins_scrap_cost, 2),
-                },
-                "tulc": {
-                    "quantity":   int(tulc_qty),
-                    "cogp_cost":  0.0,
-                    "scrap_qty":  tulc_scrap_qty,
-                    "scrap_cost": round(tulc_scrap_cost, 2),
-},
-            })
-
+            results.append({"date": date_str, **day_result})
             current += timedelta(days=1)
 
         conn.close()
@@ -1912,7 +1848,10 @@ class CogpProductionRequest(BaseModel):
 # Workcenters terminales confirmados contra el reporte nativo de Plex COGP
 # (sesión 2026-07-28) -- Frontal 2/Final 3/Frontal 3/Soldadura de Siphon son
 # operaciones intermedias y NO deben contarse como produccion terminada.
-COGP_TERMINAL_WORKCENTERS = ('HM Ensamble Final 2', 'HM Ensamble de Servicio', 'TULC Ensamble Final')
+COGP_TERMINAL_WORKCENTERS = (
+    'HM Ensamble Final 2', 'HM Ensamble de Servicio', 'TULC Ensamble Final',
+    'Velocidad Prueba Final', 'Velocidad - Prueba Final', 'Velocidad - Prueba Final 2',
+)
 WC_LIST_COGP = "', '".join(COGP_TERMINAL_WORKCENTERS)
 
 @app.post("/cogp/production-by-date", dependencies=[Security(verify_token)])
@@ -2013,6 +1952,7 @@ def cogp_scrap_range(req: CogpRangeRequest):
                 s.Report_Date                AS Report_Date,
                 wc.Workcenter_Group          AS Workcenter_Group,
                 wc.Name                      AS Workcenter,
+                p.Part_No                    AS Part_No,
                 s.Scrap_Reason                AS Scrap_Reason,
                 s.Quantity                   AS Quantity,
                 s.Extended_Cost              AS Extended_Cost
@@ -2020,10 +1960,12 @@ def cogp_scrap_range(req: CogpRangeRequest):
             INNER JOIN Part_v_Workcenter wc
                 ON s.Workcenter_Key = wc.Workcenter_Key
                 AND s.Plexus_Customer_No = wc.Plexus_Customer_No
+            INNER JOIN Part_v_Part_e p
+                ON s.Part_Key = p.Part_Key
             WHERE s.Plexus_Customer_No = {PCN}
               AND s.Report_Date >= '{start}'
               AND s.Report_Date <  '{end}'
-              AND wc.Workcenter_Group IN ('Heater Module', 'TULC')
+              AND wc.Workcenter_Group IN ('Heater Module', 'TULC', 'Speed')
         """)
         raw = query_to_list(cursor)
         conn.close()
@@ -2066,12 +2008,16 @@ def cogp_production_range(req: CogpProductionRangeRequest):
            SELECT
                 pe.Report_Date AS Report_Date,
                 wc.Name        AS Workcenter,
+                p.Part_No      AS Part_No,
                 SUM(pe.Quantity)                      AS Quantity,
                 SUM(pe.Quantity * ISNULL(pc.Cost, 0)) AS Extended_Cost
             FROM Part_v_Production_e pe
             LEFT JOIN Part_v_Workcenter wc
                 ON pe.Workcenter_Key = wc.Workcenter_Key
                 AND wc.Plexus_Customer_No = {PCN}
+            LEFT JOIN Part_v_Part_e p
+                ON pe.Part_Key = p.Part_Key
+                AND p.Plexus_Customer_No = {PCN}
             LEFT JOIN Part_v_Part_Cost pc
                 ON pe.Part_Key = pc.Part_Key
                 AND pc.PCN = {PCN}
@@ -2080,7 +2026,7 @@ def cogp_production_range(req: CogpProductionRangeRequest):
               AND pe.Report_Date >= '{start}'
               AND pe.Report_Date <  '{end}'
               AND wc.Name IN ('{WC_LIST_COGP}')
-            GROUP BY pe.Report_Date, wc.Name
+            GROUP BY pe.Report_Date, wc.Name, p.Part_No
         """)
         raw = query_to_list(cursor)
         conn.close()
