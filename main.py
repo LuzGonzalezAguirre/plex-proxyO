@@ -1,6 +1,7 @@
 import os
 import pyodbc
 import pandas as pd
+from datetime import datetime
 from fastapi import FastAPI, HTTPException, Security
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
@@ -1406,6 +1407,17 @@ def scrap_detail(req: ScrapDetailRequest):
             wc_map[wc]["scrap_cost"] += cost
             wc_map[wc][f"shift_{shift.lower()}"]["scrap_qty"] += qty
 
+        # Conserva también centros con producción y cero scrap. Además de
+        # ser correcto para un rango corto, permite sumar ventanas largas sin
+        # perder producción de un centro que sólo tuvo scrap en otra ventana.
+        for wc in prod_map:
+            wc_map.setdefault(wc, {
+                "workcenter": wc, "bu": get_bu(wc, ""),
+                "scrap_qty": 0.0, "scrap_cost": 0.0,
+                "shift_a": {"scrap_qty": 0.0},
+                "shift_b": {"scrap_qty": 0.0},
+            })
+
         by_workcenter = []
         for wc, d in wc_map.items():
             prod      = prod_map.get(wc, 0.0)
@@ -1603,6 +1615,7 @@ def scrap_detail(req: ScrapDetailRequest):
             "summary": {
                 "total_qty":   total_scrap_qty,
                 "total_cost":  total_cost,
+                "total_production": int(total_prod),
                 "yield_pct":   yield_pct,
             },
             "by_workcenter": by_workcenter,
@@ -1681,12 +1694,19 @@ def incoming_inspection_snapshot():
 
 
 class IncomingInspectionHistoryRequest(BaseModel):
-    since: str  # 'YYYY-MM-DD HH:MM:SS'
+    since: datetime
+    until: Optional[datetime] = None  # exclusive; required by chunked backfills
 
 
 @app.post("/incoming-inspection/history", dependencies=[Security(verify_token)])
 def incoming_inspection_history(req: IncomingInspectionHistoryRequest):
     try:
+        until_clause = ""
+        if req.until:
+            if req.until <= req.since:
+                raise HTTPException(status_code=400, detail="until debe ser posterior a since.")
+            until_clause = f"AND cc.Change_Date < '{req.until:%Y-%m-%d %H:%M:%S}'"
+        since_str = req.since.strftime("%Y-%m-%d %H:%M:%S")
         conn   = get_connection()
         cursor = conn.cursor()
         # Mismo caso que /incoming-inspection/snapshot: Part_v_Container_Change2
@@ -1713,11 +1733,14 @@ def incoming_inspection_history(req: IncomingInspectionHistoryRequest):
                AND cc.Plexus_Customer_No = po.Plexus_Customer_No
             WHERE cc.Plexus_Customer_No = {PCN}
               AND po.Operation_No IN (10, 11, 20)
-              AND cc.Change_Date >= '{req.since}'
+              AND cc.Change_Date >= '{since_str}'
+              {until_clause}
         """)
         data = query_to_list(cursor)
         conn.close()
         return {"data": data}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
