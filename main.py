@@ -1138,9 +1138,9 @@ def maintenance_current_down():
     """
     Estado actual real de Plex.
 
-    El registro vigente es el ultimo log de cada workcenter. A diferencia de
-    los reportes historicos, no se exige Log_Hours > 0: el evento activo suele
-    permanecer en cero hasta que Plex recibe el siguiente cambio de estado.
+    El registro vigente es el ultimo log de cada workcenter y debe seguir
+    abierto (Log_Hours = 0). Los paros con horas cerradas son historicos:
+    incluirlos provoca falsos positivos cuando el estado activo ya es Idle.
     """
     try:
         conn = get_connection()
@@ -1168,6 +1168,7 @@ def maintenance_current_down():
                AND wl.Plexus_Customer_No = we.Plexus_Customer_No
             WHERE wl.Plexus_Customer_No = {PCN}
               AND wl.Workcenter_Status_Key = 5445
+              AND ISNULL(wl.Log_Hours, 0) = 0
               AND wl.Log_Date = (
                     SELECT MAX(latest.Log_Date)
                     FROM Part_v_Workcenter_Log latest
