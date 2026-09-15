@@ -225,6 +225,12 @@ def oee_live(req: OEERequest):
             "good_qty":         totals["good_qty"],
             "scrap_qty":        totals["scrap_qty"],
             "total_qty":        totals["total_qty"],
+            # Componentes aditivos para que platformSSI pueda unir ventanas
+            # de hasta 168 dias y recalcular un OEE anual exacto. Se agregan
+            # sin retirar ningun campo del contrato existente.
+            "operating_hours":   totals["operating_hours"],
+            "plan_hours":        totals["plan_hours"],
+            "ideal_hours_total": totals["ideal_hours_total"],
             "availability_pct": total_availability,
             "performance_pct":  total_performance,
             "quality_pct":      total_quality,
