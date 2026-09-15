@@ -1130,6 +1130,109 @@ def maintenance_downtime_by_month(req: MaintenanceKPIRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
+# ─── Live down equipment ──────────────────────────────────────────────────────
+
+@app.get("/maintenance-current-down", dependencies=[Security(verify_token)])
+def maintenance_current_down():
+    """
+    Estado actual real de Plex.
+
+    El registro vigente es el ultimo log de cada workcenter. A diferencia de
+    los reportes historicos, no se exige Log_Hours > 0: el evento activo suele
+    permanecer en cero hasta que Plex recibe el siguiente cambio de estado.
+    """
+    try:
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute(f"""
+            SELECT
+                wc.Workcenter_Code                         AS Workcenter_Code,
+                wc.Name                                    AS Workcenter,
+                wc.Workcenter_Group                        AS Workcenter_Group,
+                ws.Description                             AS Status,
+                ISNULL(we.Description, 'Sin Razón')        AS Reason,
+                ISNULL(wl.Description, '')                 AS Notes,
+                wl.Log_Date                                AS Started_At,
+                ROUND(ISNULL(wl.Log_Hours, 0), 2)          AS Logged_Hours,
+                CURRENT_TIMESTAMP                          AS Plex_Now
+            FROM Part_v_Workcenter_Log wl
+            INNER JOIN Part_v_Workcenter wc
+                ON wl.Workcenter_Key = wc.Workcenter_Key
+               AND wl.Plexus_Customer_No = wc.Plexus_Customer_No
+            LEFT JOIN Part_v_Workcenter_Status ws
+                ON wl.Workcenter_Status_Key = ws.Workcenter_Status_Key
+               AND wl.Plexus_Customer_No = ws.Plexus_Customer_No
+            LEFT JOIN Part_v_Workcenter_Event we
+                ON wl.Workcenter_Event_Key = we.Workcenter_Event_Key
+               AND wl.Plexus_Customer_No = we.Plexus_Customer_No
+            WHERE wl.Plexus_Customer_No = {PCN}
+              AND wl.Workcenter_Status_Key = 5445
+              AND wl.Log_Date = (
+                    SELECT MAX(latest.Log_Date)
+                    FROM Part_v_Workcenter_Log latest
+                    WHERE latest.Plexus_Customer_No = wl.Plexus_Customer_No
+                      AND latest.Workcenter_Key = wl.Workcenter_Key
+              )
+            ORDER BY wl.Log_Date
+        """)
+        data = query_to_list(cursor)
+        conn.close()
+        return {"data": data}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class MaintenanceDownHistoryRequest(BaseModel):
+    start_date: str
+    end_date: str
+
+
+@app.post("/maintenance-down-history", dependencies=[Security(verify_token)])
+def maintenance_down_history(req: MaintenanceDownHistoryRequest):
+    """Downtime cerrado para las tendencias del modulo de equipos caidos."""
+    try:
+        start_dt = datetime.strptime(req.start_date, "%Y-%m-%d")
+        end_dt = datetime.strptime(req.end_date, "%Y-%m-%d")
+        if end_dt < start_dt:
+            raise HTTPException(status_code=400, detail="end_date anterior a start_date.")
+        if (end_dt - start_dt).days > 180:
+            raise HTTPException(status_code=400, detail="Rango maximo 180 dias.")
+
+        end_inclusive = f"{req.end_date} 23:59:59"
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute(f"""
+            SELECT
+                wl.Log_Date                                AS Started_At,
+                ROUND(ISNULL(wl.Log_Hours, 0), 2)          AS Downtime_Hours,
+                wc.Workcenter_Code                         AS Workcenter_Code,
+                wc.Name                                    AS Workcenter,
+                wc.Workcenter_Group                        AS Workcenter_Group,
+                ISNULL(we.Description, 'Sin Razón')        AS Reason
+            FROM Part_v_Workcenter_Log wl
+            INNER JOIN Part_v_Workcenter wc
+                ON wl.Workcenter_Key = wc.Workcenter_Key
+               AND wl.Plexus_Customer_No = wc.Plexus_Customer_No
+            LEFT JOIN Part_v_Workcenter_Event we
+                ON wl.Workcenter_Event_Key = we.Workcenter_Event_Key
+               AND wl.Plexus_Customer_No = we.Plexus_Customer_No
+            WHERE wl.Plexus_Customer_No = {PCN}
+              AND wl.Workcenter_Status_Key = 5445
+              AND wl.Log_Date >= '{req.start_date}'
+              AND wl.Log_Date <= '{end_inclusive}'
+              AND wl.Log_Hours > 0
+            ORDER BY wl.Log_Date
+        """)
+        data = query_to_list(cursor)
+        conn.close()
+        return {"data": data}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 WR_DATE_FIELDS = {
     "Request_Date":   "wr.Request_Date",
     "Due_Date":       "wr.Due_Date",
