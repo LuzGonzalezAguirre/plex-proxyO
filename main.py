@@ -1138,9 +1138,9 @@ def maintenance_current_down():
     """
     Estado actual real de Plex.
 
-    El registro vigente es el ultimo log de cada workcenter y debe seguir
-    abierto (Log_Hours = 0). Los paros con horas cerradas son historicos:
-    incluirlos provoca falsos positivos cuando el estado activo ya es Idle.
+    El log aporta el inicio y la razon, pero no es la fuente de verdad del
+    estado vigente. Antes de mostrar un candidato se valida Equipment_Status
+    en Maintenance_v_Equipment; si Plex ya indica Idle, queda excluido.
     """
     try:
         conn = get_connection()
@@ -1150,7 +1150,8 @@ def maintenance_current_down():
                 wc.Workcenter_Code                         AS Workcenter_Code,
                 wc.Name                                    AS Workcenter,
                 wc.Workcenter_Group                        AS Workcenter_Group,
-                ws.Description                             AS Status,
+                eq.Equipment_ID                            AS Equipment_ID,
+                eq.Equipment_Status                        AS Status,
                 ISNULL(we.Description, 'Sin Razón')        AS Reason,
                 ISNULL(wl.Description, '')                 AS Notes,
                 wl.Log_Date                                AS Started_At,
@@ -1160,15 +1161,22 @@ def maintenance_current_down():
             INNER JOIN Part_v_Workcenter wc
                 ON wl.Workcenter_Key = wc.Workcenter_Key
                AND wl.Plexus_Customer_No = wc.Plexus_Customer_No
-            LEFT JOIN Part_v_Workcenter_Status ws
-                ON wl.Workcenter_Status_Key = ws.Workcenter_Status_Key
-               AND wl.Plexus_Customer_No = ws.Plexus_Customer_No
+            INNER JOIN Maintenance_v_Equipment eq
+                ON eq.Plexus_Customer_No = wl.Plexus_Customer_No
+               AND (
+                    eq.Equipment_Key = wl.Equipment_Key
+                    OR (
+                        wl.Equipment_Key IS NULL
+                        AND eq.Workcenter_Key = wl.Workcenter_Key
+                    )
+               )
             LEFT JOIN Part_v_Workcenter_Event we
                 ON wl.Workcenter_Event_Key = we.Workcenter_Event_Key
                AND wl.Plexus_Customer_No = we.Plexus_Customer_No
             WHERE wl.Plexus_Customer_No = {PCN}
               AND wl.Workcenter_Status_Key = 5445
               AND ISNULL(wl.Log_Hours, 0) = 0
+              AND UPPER(ISNULL(eq.Equipment_Status, '')) = 'DOWN'
               AND wl.Log_Date = (
                     SELECT MAX(latest.Log_Date)
                     FROM Part_v_Workcenter_Log latest
