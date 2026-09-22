@@ -2088,6 +2088,7 @@ def cogp_scrap_range(req: CogpRangeRequest):
                 wc.Workcenter_Group          AS Workcenter_Group,
                 wc.Name                      AS Workcenter,
                 p.Part_No                    AS Part_No,
+                p.Part_Type                  AS Part_Type,
                 s.Scrap_Reason                AS Scrap_Reason,
                 s.Quantity                   AS Quantity,
                 s.Extended_Cost              AS Extended_Cost
