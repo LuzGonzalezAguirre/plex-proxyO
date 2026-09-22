@@ -2178,6 +2178,47 @@ def cogp_production_range(req: CogpProductionRangeRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+# Quantity denominator for the component Pareto. Matches the scrap-range
+# workcenter groups; the cost denominator above intentionally remains terminal-only.
+@app.post("/cogp/production-quantity-range", dependencies=[Security(verify_token)])
+def cogp_production_quantity_range(req: CogpRangeRequest):
+    try:
+        from datetime import datetime, timedelta
+        start_dt = datetime.strptime(req.start_date, "%Y-%m-%d")
+        end_dt = datetime.strptime(req.end_date, "%Y-%m-%d")
+        if end_dt < start_dt or (end_dt - start_dt).days > 180:
+            raise HTTPException(status_code=400, detail="Rango invalido o mayor a 180 dias.")
+        start = f"{req.start_date} 00:00:00"
+        end = (end_dt + timedelta(days=1)).strftime("%Y-%m-%d %H:%M:%S")
+        conn = get_connection()
+        try:
+            cursor = conn.cursor()
+            cursor.execute(f"""
+                SELECT wc.Workcenter_Group AS Workcenter_Group,
+                       wc.Name AS Workcenter,
+                       p.Part_No AS Part_No,
+                       SUM(pe.Quantity) AS Quantity
+                FROM Part_v_Production_e pe
+                INNER JOIN Part_v_Workcenter wc
+                    ON pe.Workcenter_Key = wc.Workcenter_Key
+                    AND pe.Plexus_Customer_No = wc.Plexus_Customer_No
+                INNER JOIN Part_v_Part_e p
+                    ON pe.Part_Key = p.Part_Key
+                    AND pe.Plexus_Customer_No = p.Plexus_Customer_No
+                WHERE pe.Plexus_Customer_No = {PCN}
+                  AND pe.Report_Date >= '{start}'
+                  AND pe.Report_Date < '{end}'
+                  AND wc.Workcenter_Group IN ('Heater Module', 'TULC', 'Speed')
+                GROUP BY wc.Workcenter_Group, wc.Name, p.Part_No
+            """)
+            return {"data": query_to_list(cursor)}
+        finally:
+            conn.close()
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 # ─── Workcenters (catálogo para Downtime Settings) ────────────────────────────
 
 @app.get("/workcenters", dependencies=[Security(verify_token)])
