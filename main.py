@@ -555,8 +555,8 @@ TULC_WORKCENTERS = {"TULC Ensamble Final"}
 VOLVO_PARTS       = {"43301", "43302", "43303", "43304", "43305", "43306", "43291", "45294"}
 VOLVO_WORKCENTERS = {"HM Ensamble Final 2"}
 CUMMINS_WORKCENTERS = {"HM Ensamble Final 3", "HM Ensamble Frontal 3"}
-JOHN_DEERE_WORKCENTERS = {"Velocidad - Prueba Final 3"}
-EATON_WORKCENTERS = {"Velocidad - Prueba Final"}
+JOHN_DEERE_WORKCENTERS = {"Speed - Final Test 3"}
+EATON_WORKCENTERS = {"Speed - Final Test"}
 
 ALL_PROD_WORKCENTERS = (
     VOLVO_WORKCENTERS | CUMMINS_WORKCENTERS | TULC_WORKCENTERS
@@ -1985,7 +1985,7 @@ class CogpProductionRequest(BaseModel):
 # operaciones intermedias y NO deben contarse como produccion terminada.
 COGP_TERMINAL_WORKCENTERS = (
     'HM Ensamble Final 2', 'HM Ensamble de Servicio', 'TULC Ensamble Final',
-    'Velocidad - Prueba Final', 'Velocidad - Prueba Final 3',
+    'Speed - Final Test', 'Speed - Final Test 3',
 )
 WC_LIST_COGP = "', '".join(COGP_TERMINAL_WORKCENTERS)
 
