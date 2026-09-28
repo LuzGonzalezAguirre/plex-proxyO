@@ -2142,9 +2142,10 @@ def cogp_production_range(req: CogpProductionRangeRequest):
         cursor = conn.cursor()
         cursor.execute(f"""
            SELECT
-                pe.Report_Date AS Report_Date,
-                wc.Name        AS Workcenter,
-                p.Part_No      AS Part_No,
+                pe.Report_Date       AS Report_Date,
+                wc.Workcenter_Group  AS Workcenter_Group,
+                wc.Name              AS Workcenter,
+                p.Part_No            AS Part_No,
                 SUM(pe.Quantity)                      AS Quantity,
                 SUM(pe.Quantity * ISNULL(pc.Cost, 0)) AS Extended_Cost
             FROM Part_v_Production_e pe
@@ -2162,7 +2163,7 @@ def cogp_production_range(req: CogpProductionRangeRequest):
               AND pe.Report_Date >= '{start}'
               AND pe.Report_Date <  '{end}'
               AND wc.Name IN ('{WC_LIST_COGP}')
-            GROUP BY pe.Report_Date, wc.Name, p.Part_No
+            GROUP BY pe.Report_Date, wc.Workcenter_Group, wc.Name, p.Part_No
         """)
         raw = query_to_list(cursor)
         conn.close()
