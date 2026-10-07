@@ -981,9 +981,14 @@ def maintenance_downtime_reasons(req: MaintenanceKPIRequest):
         cursor.execute(f"""
             SELECT
                 ISNULL(we.Description, 'Sin Razón') AS Reason,
+                wc.Name AS Workcenter,
+                wc.Workcenter_Group AS Workcenter_Group,
                 COUNT(*) AS Total_Events,
                 ROUND(SUM(wl.Log_Hours), 2) AS Total_Hours
             FROM Part_v_Workcenter_Log wl
+            INNER JOIN Part_v_Workcenter wc
+                ON wl.Workcenter_Key = wc.Workcenter_Key
+                AND wl.Plexus_Customer_No = wc.Plexus_Customer_No
             LEFT JOIN Part_v_Workcenter_Event we
                 ON wl.Workcenter_Event_Key = we.Workcenter_Event_Key
                 AND wl.Plexus_Customer_No = we.Plexus_Customer_No
@@ -992,7 +997,7 @@ def maintenance_downtime_reasons(req: MaintenanceKPIRequest):
               AND wl.Log_Date <  '{shift_end}'
               AND wl.Workcenter_Status_Key IN (5445, 5449)
               AND wl.Log_Hours > 0
-            GROUP BY we.Description
+            GROUP BY we.Description, wc.Name, wc.Workcenter_Group
             ORDER BY Total_Hours DESC
         """)
         rows = query_to_list(cursor)
@@ -1002,9 +1007,11 @@ def maintenance_downtime_reasons(req: MaintenanceKPIRequest):
         for r in rows:
             hrs = float(r["Total_Hours"] or 0)
             result.append({
-                "reason":       r["Reason"],
-                "total_events": int(r["Total_Events"] or 0),
-                "total_hours":  hrs,
+                "reason":            r["Reason"],
+                "workcenter":         r["Workcenter"],
+                "workcenter_group":   r["Workcenter_Group"],
+                "total_events":       int(r["Total_Events"] or 0),
+                "total_hours":        hrs,
                 "percentage":   round(hrs / grand_total * 100, 2) if grand_total > 0 else 0,
             })
         return {"data": result, "grand_total_hours": round(grand_total, 2)}
@@ -1040,6 +1047,7 @@ def maintenance_downtime_detail(req: MaintenanceDetailRequest):
                 ISNULL(we.Description, 'Sin Razón') AS Reason,
                 wl.Description  AS Notes,
                 wc.Name         AS Workcenter,
+                wc.Workcenter_Group AS Workcenter_Group,
                 sh.Shift,
                 p.Part_No,
                 po.Operation_No,
