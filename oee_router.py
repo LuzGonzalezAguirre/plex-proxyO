@@ -88,7 +88,7 @@ def oee_live(req: OEERequest):
                 WHERE pe.Plexus_Customer_No = {PCN}
                     AND CAST(pe.Report_Date AS DATE) >= '{req.start_date}'
                     AND CAST(pe.Report_Date AS DATE) <= '{req.end_date}'
-                GROUP BY pt.Part_No, pt.Revision, wc.Name, wc.Workcenter_Group, wc.Workcenter_Group, wc.Workcenter_Group, pe.Part_Operation_Key
+                GROUP BY pt.Part_No, pt.Revision, wc.Name, wc.Workcenter_Group, pe.Part_Operation_Key
             """)
             production_detail = cursor.fetchall()
 
@@ -125,7 +125,7 @@ def oee_live(req: OEERequest):
                 WHERE s.Plexus_Customer_No = {PCN}
                     AND CAST(s.Scrap_Date AS DATE) >= '{req.start_date}'
                     AND CAST(s.Scrap_Date AS DATE) <= '{req.end_date}'
-                GROUP BY pt.Part_No, pt.Revision, wc.Name
+                GROUP BY pt.Part_No, pt.Revision, wc.Name, wc.Workcenter_Group
             """)
             scrap = {(r[0], r[1], r[2], r[3]): float(r[4] or 0) for r in cursor.fetchall()}
 
@@ -144,7 +144,7 @@ def oee_live(req: OEERequest):
                 WHERE wl.Plexus_Customer_No = {PCN}
                     AND wl.Log_Date >= '{shift_start}'
                     AND wl.Log_Date <  '{shift_end}'
-                GROUP BY pt.Part_No, pt.Revision, wc.Name
+                GROUP BY pt.Part_No, pt.Revision, wc.Name, wc.Workcenter_Group
             """)
             operating_hours = {(r[0], r[1], r[2], r[3]): (float(r[4] or 0), float(r[5] or 0)) for r in cursor.fetchall()}
 
