@@ -76,6 +76,7 @@ def oee_live(req: OEERequest):
             cursor.execute(f"""
                 SELECT
                     pt.Part_No, pt.Revision, wc.Name AS Workcenter,
+                    wc.Workcenter_Group AS Workcenter_Group,
                     pe.Part_Operation_Key, SUM(pe.Quantity) AS Good_Qty
                 FROM Part_v_Production_e AS pe
                 INNER JOIN Part_v_Workcenter AS wc
@@ -87,7 +88,7 @@ def oee_live(req: OEERequest):
                 WHERE pe.Plexus_Customer_No = {PCN}
                     AND CAST(pe.Report_Date AS DATE) >= '{req.start_date}'
                     AND CAST(pe.Report_Date AS DATE) <= '{req.end_date}'
-                GROUP BY pt.Part_No, pt.Revision, wc.Name, pe.Part_Operation_Key
+                GROUP BY pt.Part_No, pt.Revision, wc.Name, wc.Workcenter_Group, wc.Workcenter_Group, wc.Workcenter_Group, pe.Part_Operation_Key
             """)
             production_detail = cursor.fetchall()
 
@@ -111,7 +112,9 @@ def oee_live(req: OEERequest):
 
             # ── 3. Scrap ─────────────────────────────────────────────────────
             cursor.execute(f"""
-                SELECT pt.Part_No, pt.Revision, wc.Name AS Workcenter, SUM(s.Quantity) AS Scrap_Qty
+                SELECT pt.Part_No, pt.Revision, wc.Name AS Workcenter,
+                       wc.Workcenter_Group AS Workcenter_Group,
+                       SUM(s.Quantity) AS Scrap_Qty
                 FROM Part_v_Scrap AS s
                 INNER JOIN Part_v_Workcenter AS wc
                     ON s.Workcenter_Key = wc.Workcenter_Key
@@ -124,7 +127,7 @@ def oee_live(req: OEERequest):
                     AND CAST(s.Scrap_Date AS DATE) <= '{req.end_date}'
                 GROUP BY pt.Part_No, pt.Revision, wc.Name
             """)
-            scrap = {(r[0], r[1], r[2]): float(r[3] or 0) for r in cursor.fetchall()}
+            scrap = {(r[0], r[1], r[2], r[3]): float(r[4] or 0) for r in cursor.fetchall()}
 
             # ── 4. Horas operando / planeadas ───────────────────────────────
             # Ya usa get_shift_window (offset de 6 horas), validado exacto
@@ -132,6 +135,7 @@ def oee_live(req: OEERequest):
             cursor.execute(f"""
                 SELECT
                     pt.Part_No, pt.Revision, wc.Name AS Workcenter,
+                    wc.Workcenter_Group AS Workcenter_Group,
                     ISNULL(SUM(CASE WHEN wl.Workcenter_Status_Key = 5448 THEN wl.Log_Hours ELSE 0 END), 0) AS Operating_Hours,
                     ISNULL(SUM(CASE WHEN wl.Workcenter_Status_Key IN (5448,5445,5449) THEN wl.Log_Hours ELSE 0 END), 0) AS Plan_Hours
                 FROM Part_v_Workcenter_Log AS wl
@@ -142,13 +146,13 @@ def oee_live(req: OEERequest):
                     AND wl.Log_Date <  '{shift_end}'
                 GROUP BY pt.Part_No, pt.Revision, wc.Name
             """)
-            operating_hours = {(r[0], r[1], r[2]): (float(r[3] or 0), float(r[4] or 0)) for r in cursor.fetchall()}
+            operating_hours = {(r[0], r[1], r[2], r[3]): (float(r[4] or 0), float(r[5] or 0)) for r in cursor.fetchall()}
 
         # ── Agregacion en Python (el driver ODBC de Plex no soporta CTEs) ────
         good_qty_by_key         = defaultdict(float)
         ideal_hours_good_by_key = defaultdict(float)
-        for part_no, revision, workcenter, op_key, qty in production_detail:
-            key  = (part_no, revision, workcenter)
+        for part_no, revision, workcenter, workcenter_group, op_key, qty in production_detail:
+            key  = (part_no, revision, workcenter, workcenter_group)
             qty  = float(qty or 0)
             good_qty_by_key[key] += qty
             rate = ideal_rate_detail.get((op_key, workcenter))
@@ -168,7 +172,7 @@ def oee_live(req: OEERequest):
                   "operating_hours": 0.0, "plan_hours": 0.0, "ideal_hours_total": 0.0}
 
         for key in all_keys:
-            part_no, revision, workcenter = key
+            part_no, revision, workcenter, workcenter_group = key
             good_qty  = good_qty_by_key.get(key, 0.0)
             scrap_qty = scrap.get(key, 0.0)
             total_qty = good_qty + scrap_qty
@@ -192,6 +196,8 @@ def oee_live(req: OEERequest):
 
             details.append({
                 "part_workcenter":  f"{part_no} Rev:{revision} - {workcenter}",
+                "workcenter":       workcenter,
+                "workcenter_group": workcenter_group,
                 "good_qty":         good_qty,
                 "scrap_qty":        scrap_qty,
                 "total_qty":        total_qty,
@@ -199,6 +205,9 @@ def oee_live(req: OEERequest):
                 "performance_pct":  performance_pct,
                 "quality_pct":      quality_pct,
                 "oee_pct":          oee_pct,
+                "operating_hours":   op_hrs,
+                "plan_hours":        plan_hrs,
+                "ideal_hours_total": ideal_hours_total or 0.0,
                 # TEMPORAL para diagnostico del "OEE semanal disparado" --
                 # quitar este campo una vez resuelto. Deja ver a simple vista
                 # que tasa (Ideal_Rate efectiva) se aplico a cada fila.
