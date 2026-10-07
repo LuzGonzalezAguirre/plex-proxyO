@@ -922,6 +922,8 @@ def maintenance_kpis(req: MaintenanceKPIRequest):
         cursor = conn.cursor()
         cursor.execute(f"""
             SELECT
+                wc.Name AS Workcenter,
+                wc.Workcenter_Group AS Workcenter_Group,
                 ROUND(SUM(CASE WHEN wl.Workcenter_Status_Key = 5448 THEN wl.Log_Hours ELSE 0 END), 2) AS Operating_Hours,
                 ROUND(SUM(CASE WHEN wl.Workcenter_Status_Key IN (5445, 5449) THEN wl.Log_Hours ELSE 0 END), 2) AS Downtime_Hours,
                 ROUND(SUM(CASE WHEN wl.Workcenter_Status_Key = 5445
@@ -929,22 +931,11 @@ def maintenance_kpis(req: MaintenanceKPIRequest):
                                THEN wl.Log_Hours ELSE 0 END), 2) AS Down_Hours,
                 ROUND(SUM(CASE WHEN wl.Workcenter_Status_Key = 5449 THEN wl.Log_Hours ELSE 0 END), 2) AS Setup_Hours,
                 ROUND(SUM(CASE WHEN wl.Workcenter_Status_Key = 5446 THEN wl.Log_Hours ELSE 0 END), 2) AS Idle_Hours,
-                SUM(CASE WHEN wl.Workcenter_Status_Key = 5445 THEN 1 ELSE 0 END) AS Total_Failures,
-                ROUND(
-                    SUM(CASE WHEN wl.Workcenter_Status_Key = 5445 THEN wl.Log_Hours ELSE 0 END) /
-                    NULLIF(SUM(CASE WHEN wl.Workcenter_Status_Key = 5445 THEN 1 ELSE 0 END), 0)
-                , 2) AS MTTR_Hours,
-                ROUND(
-                    SUM(CASE WHEN wl.Workcenter_Status_Key = 5448 THEN wl.Log_Hours ELSE 0 END) /
-                    NULLIF(SUM(CASE WHEN wl.Workcenter_Status_Key = 5445 THEN 1 ELSE 0 END), 0)
-                , 2) AS MTBF_Hours,
-                ROUND(
-                    SUM(CASE WHEN wl.Workcenter_Status_Key = 5448 THEN wl.Log_Hours ELSE 0 END) * 100.0 /
-                    NULLIF(
-                        SUM(CASE WHEN wl.Workcenter_Status_Key IN (5448, 5445, 5449) THEN wl.Log_Hours ELSE 0 END)
-                    , 0)
-                , 2) AS Availability_Pct
+                SUM(CASE WHEN wl.Workcenter_Status_Key = 5445 THEN 1 ELSE 0 END) AS Total_Failures
             FROM Part_v_Workcenter_Log wl
+            INNER JOIN Part_v_Workcenter wc
+                ON wl.Workcenter_Key = wc.Workcenter_Key
+                AND wl.Plexus_Customer_No = wc.Plexus_Customer_No
             LEFT JOIN Part_v_Workcenter_Event we
                 ON wl.Workcenter_Event_Key = we.Workcenter_Event_Key
                 AND wl.Plexus_Customer_No = we.Plexus_Customer_No
@@ -952,20 +943,53 @@ def maintenance_kpis(req: MaintenanceKPIRequest):
               AND wl.Log_Date >= '{shift_start}'
               AND wl.Log_Date <  '{shift_end}'
               AND wl.Log_Hours > 0
+            GROUP BY wc.Name, wc.Workcenter_Group
         """)
-        row = cursor.fetchone()
+        raw_rows = query_to_list(cursor)
         conn.close()
-        if not row:
-            return {"data": None}
-        keys = [
-            "operating_hours", "downtime_hours", "down_hours", "setup_hours",
-            "idle_hours", "total_failures", "mttr_hours", "mtbf_hours", "availability_pct"
-        ]
-        result = {}
-        for i, key in enumerate(keys):
-            val = row[i]
-            result[key] = float(val) if val is not None else None
-        return {"data": result}
+
+        totals = {
+            "operating_hours": 0.0,
+            "downtime_hours": 0.0,
+            "down_hours": 0.0,
+            "setup_hours": 0.0,
+            "idle_hours": 0.0,
+            "total_failures": 0,
+        }
+        by_workcenter = []
+        for row in raw_rows:
+            item = {
+                "workcenter": row["Workcenter"],
+                "workcenter_group": row["Workcenter_Group"],
+                "operating_hours": float(row["Operating_Hours"] or 0),
+                "downtime_hours": float(row["Downtime_Hours"] or 0),
+                "down_hours": float(row["Down_Hours"] or 0),
+                "setup_hours": float(row["Setup_Hours"] or 0),
+                "idle_hours": float(row["Idle_Hours"] or 0),
+                "total_failures": int(row["Total_Failures"] or 0),
+            }
+            by_workcenter.append(item)
+            for field in (
+                "operating_hours", "downtime_hours", "down_hours",
+                "setup_hours", "idle_hours",
+            ):
+                totals[field] += item[field]
+            totals["total_failures"] += item["total_failures"]
+
+        failures = totals["total_failures"]
+        operating = totals["operating_hours"]
+        downtime = totals["downtime_hours"]
+        failure_hours = max(downtime - totals["setup_hours"], 0)
+        planned = operating + downtime
+
+        result = {
+            **{field: round(value, 2) for field, value in totals.items() if field != "total_failures"},
+            "total_failures": failures,
+            "mttr_hours": round(failure_hours / failures, 2) if failures else None,
+            "mtbf_hours": round(operating / failures, 2) if failures else None,
+            "availability_pct": round(operating * 100.0 / planned, 2) if planned else None,
+        }
+        return {"data": result, "by_workcenter": by_workcenter}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
