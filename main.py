@@ -946,6 +946,22 @@ def maintenance_kpis(req: MaintenanceKPIRequest):
             GROUP BY wc.Name, wc.Workcenter_Group
         """)
         raw_rows = query_to_list(cursor)
+
+        # Unplanned Work Requests represent plant-wide maintenance failures.
+        # Do not join workcenters or failure details: one request is one failure,
+        # even when it has no workcenter or multiple failure classifications.
+        cursor.execute(f"""
+            SELECT COUNT(DISTINCT wr.Work_Request_Key) AS Unplanned_Failures
+            FROM Maintenance_v_Work_Request wr
+            INNER JOIN Maintenance_v_Work_Request_Type wt
+                ON wr.Work_Request_Type_Key = wt.Work_Request_Type_Key
+            WHERE wr.Plexus_Customer_No = {PCN}
+              AND wt.Work_Request_Type = 'Unplanned Maintenance'
+              AND wr.Request_Date >= '{shift_start}'
+              AND wr.Request_Date < '{shift_end}'
+        """)
+        unplanned_row = cursor.fetchone()
+        unplanned_failures = int(unplanned_row[0] or 0) if unplanned_row else 0
         conn.close()
 
         totals = {
@@ -984,7 +1000,8 @@ def maintenance_kpis(req: MaintenanceKPIRequest):
 
         result = {
             **{field: round(value, 2) for field, value in totals.items() if field != "total_failures"},
-            "total_failures": failures,
+            "total_failures": failures,  # Legacy Down-event count for MTTR
+            "unplanned_failures": unplanned_failures,  # Global WR count for MTBF
             "mttr_hours": round(failure_hours / failures, 2) if failures else None,
             "mtbf_hours": round(operating / failures, 2) if failures else None,
             "availability_pct": round(operating * 100.0 / planned, 2) if planned else None,
