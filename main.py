@@ -421,23 +421,6 @@ class DemandRequest(BaseModel):
     release_types: Optional[list[str]] = None
 
 
-CUSTOMER_CASE = """
-    CASE
-        WHEN po.Customer_No = 332159 THEN 'Autocar'
-        WHEN po.Customer_No IN (768299, 768300) THEN 'Capacity'
-        WHEN po.Customer_No = 338766 THEN 'Claas'
-        WHEN po.Customer_No = 332165 THEN 'Cummins'
-        WHEN po.Customer_No = 332169 THEN 'Elkamet'
-        WHEN po.Customer_No = 332170 THEN 'Elkhart'
-        WHEN po.Customer_No = 773112 THEN 'Girtz'
-        WHEN po.Customer_No = 332183 THEN 'JLG'
-        WHEN po.Customer_No = 332185 THEN 'Kautex'
-        WHEN po.Customer_No = 332205 THEN 'SSI-Plainfield'
-        WHEN po.Customer_No = 332211 THEN 'Volvo'
-        ELSE 'Customer ' + CAST(po.Customer_No AS VARCHAR)
-    END
-"""
-
 MULTI_CUSTOMER = {768299: (768299, 768300)}
 
 
@@ -502,7 +485,7 @@ def demand(req: DemandRequest):
 
         query = f"""
             SELECT
-                {CUSTOMER_CASE}                                         AS Customer,
+                ISNULL(cust.Name, 'Customer ' + CAST(po.Customer_No AS VARCHAR)) AS Customer,
                 ISNULL(po.PO_No, '')                                    AS PO_Rel,
                 ISNULL(pos.PO_Status, 'Open')                           AS PO_Status,
                 ISNULL(r.Ship_To, '')                                   AS Ship_To_Carrier,
@@ -522,6 +505,8 @@ def demand(req: DemandRequest):
                 ON r.PO_Line_Key = pol.PO_Line_Key AND r.PCN = pol.PCN
             LEFT JOIN Sales_v_PO AS po
                 ON pol.PO_Key = po.PO_Key AND r.PCN = po.PCN
+            LEFT JOIN Common_v_Customer AS cust
+                ON cust.Customer_No = po.Customer_No AND cust.Plexus_Customer_No = po.PCN
             LEFT JOIN Sales_v_PO_Status AS pos
                 ON po.PO_Status_Key = pos.PO_Status_Key AND r.PCN = pos.PCN
             LEFT JOIN Sales_v_Release_Status AS rs
