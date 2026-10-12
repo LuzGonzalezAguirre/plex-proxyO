@@ -485,6 +485,7 @@ def demand(req: DemandRequest):
 
         query = f"""
             SELECT
+                r.Release_Key AS Release_Key,
                 ISNULL(cust.Name, 'Customer ' + CAST(po.Customer_No AS VARCHAR)) AS Customer,
                 ISNULL(po.PO_No, '')                                    AS PO_Rel,
                 ISNULL(pos.PO_Status, 'Open')                           AS PO_Status,
@@ -551,11 +552,49 @@ def demand(req: DemandRequest):
         """
 
         conn = get_connection()
-        cursor = conn.cursor()
-        cursor.execute(query)
-        data = query_to_list(cursor)
-        conn.close()
-        return {"data": data}
+        try:
+            cursor = conn.cursor()
+            try:
+                cursor.execute(query)
+                data = query_to_list(cursor)
+
+                # A release can have several shippers. Resolve them separately
+                # so demand quantities and the number of releases stay unchanged.
+                release_keys = sorted({
+                    int(row["Release_Key"])
+                    for row in data if row.get("Release_Key") is not None
+                })
+                shippers_by_release = {}
+                batch_size = 75
+                for offset in range(0, len(release_keys), batch_size):
+                    keys = ", ".join(str(key) for key in release_keys[offset:offset + batch_size])
+                    shipper_query = f"""
+                        SELECT slr.Release_Key, s.Shipper_No
+                        FROM Sales_v_Shipper_Line_Release AS slr
+                        INNER JOIN Sales_v_Shipper_Line AS sl
+                            ON sl.Shipper_Line_Key = slr.Shipper_Line_Key
+                           AND sl.PCN = slr.PCN
+                        INNER JOIN Sales_v_Shipper AS s
+                            ON s.Shipper_Key = sl.Shipper_Key
+                           AND s.PCN = sl.PCN
+                        WHERE slr.PCN = {PCN}
+                          AND slr.Release_Key IN ({keys})
+                    """
+                    cursor.execute(shipper_query)
+                    for release_key, shipper_no in cursor.fetchall():
+                        if shipper_no is not None:
+                            shippers_by_release.setdefault(int(release_key), set()).add(str(shipper_no))
+
+                for row in data:
+                    release_key = row.pop("Release_Key", None)
+                    numbers = shippers_by_release.get(int(release_key), set()) if release_key is not None else set()
+                    row["Shipper_No"] = ", ".join(sorted(numbers))
+
+                return {"data": data}
+            finally:
+                cursor.close()
+        finally:
+            conn.close()
 
     except HTTPException:
         raise
