@@ -491,8 +491,8 @@ def demand(req: DemandRequest):
                 ISNULL(r.Ship_To, '')                                   AS Ship_To_Carrier,
                 p.Part_No + '.' + p.Revision                           AS Part_No_Rev,
                 ISNULL(cp.Customer_Part_No, '')                         AS Cust_Part,
-                r.Quantity - ISNULL(r.Quantity_Shipped, 0)             AS Qty_Ready,
-                ISNULL(wip.WIP_Quantity, 0)                             AS Qty_WIP,
+                ISNULL(inv.Ready_Quantity, 0)                           AS Qty_Ready,
+                ISNULL(inv.WIP_Quantity, 0)                             AS Qty_WIP,
                 r.Ship_Date                                             AS Ship_Date,
                 r.Due_Date                                              AS Due_Date,
                 r.Quantity                                              AS Rel_Qty,
@@ -519,14 +519,26 @@ def demand(req: DemandRequest):
                 ON pol.Customer_Part_Key = cp.Customer_Part_Key AND r.PCN = cp.Plexus_Customer_No
             LEFT JOIN (
                 SELECT c.Part_Key, c.Plexus_Customer_No,
-                       SUM(CASE WHEN c.Location NOT LIKE '%TIJ%' OR c.Location IS NULL
-                                THEN c.Quantity ELSE 0 END) AS WIP_Quantity
+                       SUM(CASE WHEN op.Shippable = 1 THEN c.Quantity ELSE 0 END) AS Ready_Quantity,
+                       SUM(CASE WHEN op.Shippable = 0 THEN c.Quantity ELSE 0 END) AS WIP_Quantity
                 FROM Part_v_Container AS c
+                INNER JOIN Part_v_Part_Operation AS op
+                    ON c.Part_Operation_Key = op.Part_Operation_Key
+                   AND c.Part_Key = op.Part_Key
+                   AND c.Plexus_Customer_No = op.Plexus_Customer_No
+                INNER JOIN Part_v_Container_Status AS cs
+                    ON c.Container_Status = cs.Container_Status
+                   AND c.Plexus_Customer_No = cs.Plexus_Customer_No
                 WHERE c.Plexus_Customer_No = {PCN}
+                  AND c.Active = 1
                   AND c.Quantity > 0
+                  AND op.Active = 1
+                  AND cs.Allow_Ship = 1
+                  AND cs.Defective = 0
+                  AND cs.Scrap = 0
                 GROUP BY c.Part_Key, c.Plexus_Customer_No
-            ) AS wip
-                ON p.Part_Key = wip.Part_Key AND p.Plexus_Customer_No = wip.Plexus_Customer_No
+            ) AS inv
+                ON p.Part_Key = inv.Part_Key AND p.Plexus_Customer_No = inv.Plexus_Customer_No
             WHERE r.PCN = {PCN}
               {customer_filter}
               {status_filter}
