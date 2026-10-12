@@ -414,6 +414,11 @@ def bom_ctb(req: BomCtbRequest):
 class DemandRequest(BaseModel):
     customer_no: Optional[int] = None
     release_status: str = "Open"
+    ship_date_from: Optional[str] = None
+    ship_date_to: Optional[str] = None
+    po: Optional[str] = None
+    customer_part_no: Optional[str] = None
+    release_types: Optional[list[str]] = None
 
 
 CUSTOMER_CASE = """
@@ -433,7 +438,6 @@ CUSTOMER_CASE = """
     END
 """
 
-ALL_CUSTOMERS = "(332159, 768299, 768300, 338766, 332165, 332169, 332170, 773112, 332183, 332185, 332205, 332211)"
 MULTI_CUSTOMER = {768299: (768299, 768300)}
 
 
@@ -441,12 +445,47 @@ MULTI_CUSTOMER = {768299: (768299, 768300)}
 def demand(req: DemandRequest):
     try:
         if req.customer_no is None:
-            customer_filter = f"AND po.Customer_No IN {ALL_CUSTOMERS}"
+            customer_filter = ""
         elif req.customer_no in MULTI_CUSTOMER:
             nos = ', '.join(str(n) for n in MULTI_CUSTOMER[req.customer_no])
             customer_filter = f"AND po.Customer_No IN ({nos})"
         else:
             customer_filter = f"AND po.Customer_No = {req.customer_no}"
+
+        if req.release_status not in ("Open", "History", "All"):
+            raise HTTPException(status_code=422, detail="Invalid release_status")
+
+        # Validate the optional date window before querying Plex.
+        if bool(req.ship_date_from) != bool(req.ship_date_to):
+            raise HTTPException(status_code=422, detail="Both ship dates are required")
+        date_filter = ""
+        if req.ship_date_from and req.ship_date_to:
+            try:
+                start = datetime.strptime(req.ship_date_from, "%Y-%m-%d").date()
+                end = datetime.strptime(req.ship_date_to, "%Y-%m-%d").date()
+            except ValueError:
+                raise HTTPException(status_code=422, detail="Dates must use YYYY-MM-DD")
+            if start > end or (end - start).days > 180:
+                raise HTTPException(status_code=422, detail="Ship date range must be 0–180 days")
+            date_filter = f"AND r.Ship_Date >= '{start.isoformat()}' AND r.Ship_Date < DATEADD(day, 1, '{end.isoformat()}')"
+
+        def safe_like(value: Optional[str], column: str) -> str:
+            if not value or not value.strip():
+                return ""
+            if len(value) > 100:
+                raise HTTPException(status_code=422, detail="Search filter is too long")
+            escaped = value.strip().replace("'", "''").replace("[", "[[]").replace("%", "[%]").replace("_", "[_]")
+            return f"AND {column} LIKE '%{escaped}%'"
+
+        po_filter = safe_like(req.po, "po.PO_No")
+        part_filter = safe_like(req.customer_part_no, "cp.Customer_Part_No")
+        allowed_types = {"Firm (862)", "CZ Ship", "Forecast", "HOLD", "Non-MRP Release", "Pass Through", "Planning (830)", "Projected", "Ramp Plan"}
+        type_filter = ""
+        if req.release_types:
+            if any(x not in allowed_types for x in req.release_types):
+                raise HTTPException(status_code=422, detail="Invalid release type")
+            quoted_types = ", ".join("'" + x.replace("'", "''") + "'" for x in sorted(set(req.release_types)))
+            type_filter = f"AND rt.Release_Type IN ({quoted_types})"
 
         if req.release_status == "Open":
             status_filter  = "AND rs.Release_Status = 'Open'"
@@ -507,6 +546,10 @@ def demand(req: DemandRequest):
               {customer_filter}
               {status_filter}
               {balance_filter}
+              {date_filter}
+              {po_filter}
+              {part_filter}
+              {type_filter}
             ORDER BY Customer, r.Ship_Date {order_dir}, p.Part_No
         """
 
@@ -517,6 +560,8 @@ def demand(req: DemandRequest):
         conn.close()
         return {"data": data}
 
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
