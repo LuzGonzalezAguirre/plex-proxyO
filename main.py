@@ -962,6 +962,34 @@ def maintenance_kpis(req: MaintenanceKPIRequest):
         """)
         unplanned_row = cursor.fetchone()
         unplanned_failures = int(unplanned_row[0] or 0) if unplanned_row else 0
+
+        # Independent of production logs: include workcenters with no Running
+        # records and explicitly retain unmapped requests in UNCLASSIFIED.
+        cursor.execute(f"""
+            SELECT
+                wc.Name AS Workcenter,
+                wc.Workcenter_Group AS Workcenter_Group,
+                COUNT(DISTINCT wr.Work_Request_Key) AS Unplanned_Failures
+            FROM Maintenance_v_Work_Request wr
+            INNER JOIN Maintenance_v_Work_Request_Type wt
+                ON wr.Work_Request_Type_Key = wt.Work_Request_Type_Key
+            LEFT JOIN Part_v_Workcenter wc
+                ON wr.Workcenter_Key = wc.Workcenter_Key
+                AND wr.Plexus_Customer_No = wc.Plexus_Customer_No
+            WHERE wr.Plexus_Customer_No = {PCN}
+              AND wt.Work_Request_Type = 'Unplanned Maintenance'
+              AND wr.Request_Date >= '{shift_start}'
+              AND wr.Request_Date < '{shift_end}'
+            GROUP BY wc.Name, wc.Workcenter_Group
+        """)
+        unplanned_by_workcenter = [
+            {
+                "workcenter": row["Workcenter"],
+                "workcenter_group": row["Workcenter_Group"],
+                "unplanned_failures": int(row["Unplanned_Failures"] or 0),
+            }
+            for row in query_to_list(cursor)
+        ]
         conn.close()
 
         totals = {
@@ -1006,7 +1034,7 @@ def maintenance_kpis(req: MaintenanceKPIRequest):
             "mtbf_hours": round(operating / failures, 2) if failures else None,
             "availability_pct": round(operating * 100.0 / planned, 2) if planned else None,
         }
-        return {"data": result, "by_workcenter": by_workcenter}
+        return {"data": result, "by_workcenter": by_workcenter, "unplanned_by_workcenter": unplanned_by_workcenter}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
