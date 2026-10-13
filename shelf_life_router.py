@@ -6,6 +6,9 @@ SHELF_LIFE_SQL = """
 SELECT
     c.Serial_No,
     c.Part_Key,
+    p.Part_No,
+    p.Revision,
+    p.Name AS Part_Name,
     c.Quantity,
     c.Location,
     c.Container_Status,
@@ -17,6 +20,9 @@ SELECT
         ELSE NULL
     END AS Expired_Date
 FROM Part_v_Container AS c
+INNER JOIN Part_v_Part AS p
+    ON c.Part_Key = p.Part_Key
+    AND c.Plexus_Customer_No = p.Plexus_Customer_No
 INNER JOIN Part_v_Part_Shelf_Life AS psl
     ON c.Part_Key = psl.Part_Key
     AND c.Plexus_Customer_No = psl.PCN
