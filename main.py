@@ -8,6 +8,7 @@ from pydantic import BaseModel
 from typing import Optional
 from dotenv import load_dotenv
 from oee_router import router as oee_router_router
+from shelf_life_router import make_shelf_life_router
 
 load_dotenv()
 
@@ -54,6 +55,8 @@ def query_to_list(cursor) -> list[dict]:
         result.append(record)
     return result
 
+
+app.include_router(make_shelf_life_router(get_connection, query_to_list, verify_token))
 
 # ─── Health ───────────────────────────────────────────────────────────────────
 
