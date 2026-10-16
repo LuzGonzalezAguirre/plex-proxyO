@@ -419,26 +419,13 @@ def bom_ctb(req: BomCtbRequest):
 class DemandRequest(BaseModel):
     customer_no: Optional[int] = None
     release_status: str = "Open"
+    ship_date_from: Optional[str] = None
+    ship_date_to: Optional[str] = None
+    po: Optional[str] = None
+    customer_part_no: Optional[str] = None
+    release_types: Optional[list[str]] = None
 
 
-CUSTOMER_CASE = """
-    CASE
-        WHEN po.Customer_No = 332159 THEN 'Autocar'
-        WHEN po.Customer_No IN (768299, 768300) THEN 'Capacity'
-        WHEN po.Customer_No = 338766 THEN 'Claas'
-        WHEN po.Customer_No = 332165 THEN 'Cummins'
-        WHEN po.Customer_No = 332169 THEN 'Elkamet'
-        WHEN po.Customer_No = 332170 THEN 'Elkhart'
-        WHEN po.Customer_No = 773112 THEN 'Girtz'
-        WHEN po.Customer_No = 332183 THEN 'JLG'
-        WHEN po.Customer_No = 332185 THEN 'Kautex'
-        WHEN po.Customer_No = 332205 THEN 'SSI-Plainfield'
-        WHEN po.Customer_No = 332211 THEN 'Volvo'
-        ELSE 'Customer ' + CAST(po.Customer_No AS VARCHAR)
-    END
-"""
-
-ALL_CUSTOMERS = "(332159, 768299, 768300, 338766, 332165, 332169, 332170, 773112, 332183, 332185, 332205, 332211)"
 MULTI_CUSTOMER = {768299: (768299, 768300)}
 
 
@@ -446,12 +433,47 @@ MULTI_CUSTOMER = {768299: (768299, 768300)}
 def demand(req: DemandRequest):
     try:
         if req.customer_no is None:
-            customer_filter = f"AND po.Customer_No IN {ALL_CUSTOMERS}"
+            customer_filter = ""
         elif req.customer_no in MULTI_CUSTOMER:
             nos = ', '.join(str(n) for n in MULTI_CUSTOMER[req.customer_no])
             customer_filter = f"AND po.Customer_No IN ({nos})"
         else:
             customer_filter = f"AND po.Customer_No = {req.customer_no}"
+
+        if req.release_status not in ("Open", "History", "All"):
+            raise HTTPException(status_code=422, detail="Invalid release_status")
+
+        # Validate the optional date window before querying Plex.
+        if bool(req.ship_date_from) != bool(req.ship_date_to):
+            raise HTTPException(status_code=422, detail="Both ship dates are required")
+        date_filter = ""
+        if req.ship_date_from and req.ship_date_to:
+            try:
+                start = datetime.strptime(req.ship_date_from, "%Y-%m-%d").date()
+                end = datetime.strptime(req.ship_date_to, "%Y-%m-%d").date()
+            except ValueError:
+                raise HTTPException(status_code=422, detail="Dates must use YYYY-MM-DD")
+            if start > end or (end - start).days > 180:
+                raise HTTPException(status_code=422, detail="Ship date range must be 0–180 days")
+            date_filter = f"AND r.Ship_Date >= '{start.isoformat()}' AND r.Ship_Date < DATEADD(day, 1, '{end.isoformat()}')"
+
+        def safe_like(value: Optional[str], column: str) -> str:
+            if not value or not value.strip():
+                return ""
+            if len(value) > 100:
+                raise HTTPException(status_code=422, detail="Search filter is too long")
+            escaped = value.strip().replace("'", "''").replace("[", "[[]").replace("%", "[%]").replace("_", "[_]")
+            return f"AND {column} LIKE '%{escaped}%'"
+
+        po_filter = safe_like(req.po, "po.PO_No")
+        part_filter = safe_like(req.customer_part_no, "cp.Customer_Part_No")
+        allowed_types = {"Firm (862)", "CZ Ship", "Forecast", "HOLD", "Non-MRP Release", "Pass Through", "Planning (830)", "Projected", "Ramp Plan"}
+        type_filter = ""
+        if req.release_types:
+            if any(x not in allowed_types for x in req.release_types):
+                raise HTTPException(status_code=422, detail="Invalid release type")
+            quoted_types = ", ".join("'" + x.replace("'", "''") + "'" for x in sorted(set(req.release_types)))
+            type_filter = f"AND rt.Release_Type IN ({quoted_types})"
 
         if req.release_status == "Open":
             status_filter  = "AND rs.Release_Status = 'Open'"
@@ -468,14 +490,15 @@ def demand(req: DemandRequest):
 
         query = f"""
             SELECT
-                {CUSTOMER_CASE}                                         AS Customer,
+                r.Release_Key AS Release_Key,
+                ISNULL(cust.Name, 'Customer ' + CAST(po.Customer_No AS VARCHAR)) AS Customer,
                 ISNULL(po.PO_No, '')                                    AS PO_Rel,
                 ISNULL(pos.PO_Status, 'Open')                           AS PO_Status,
                 ISNULL(r.Ship_To, '')                                   AS Ship_To_Carrier,
                 p.Part_No + '.' + p.Revision                           AS Part_No_Rev,
                 ISNULL(cp.Customer_Part_No, '')                         AS Cust_Part,
-                r.Quantity - ISNULL(r.Quantity_Shipped, 0)             AS Qty_Ready,
-                ISNULL(wip.WIP_Quantity, 0)                             AS Qty_WIP,
+                ISNULL(inv.Ready_Quantity, 0)                           AS Qty_Ready,
+                ISNULL(inv.WIP_Quantity, 0)                             AS Qty_WIP,
                 r.Ship_Date                                             AS Ship_Date,
                 r.Due_Date                                              AS Due_Date,
                 r.Quantity                                              AS Rel_Qty,
@@ -488,6 +511,8 @@ def demand(req: DemandRequest):
                 ON r.PO_Line_Key = pol.PO_Line_Key AND r.PCN = pol.PCN
             LEFT JOIN Sales_v_PO AS po
                 ON pol.PO_Key = po.PO_Key AND r.PCN = po.PCN
+            LEFT JOIN Common_v_Customer AS cust
+                ON cust.Customer_No = po.Customer_No AND cust.Plexus_Customer_No = po.PCN
             LEFT JOIN Sales_v_PO_Status AS pos
                 ON po.PO_Status_Key = pos.PO_Status_Key AND r.PCN = pos.PCN
             LEFT JOIN Sales_v_Release_Status AS rs
@@ -500,28 +525,84 @@ def demand(req: DemandRequest):
                 ON pol.Customer_Part_Key = cp.Customer_Part_Key AND r.PCN = cp.Plexus_Customer_No
             LEFT JOIN (
                 SELECT c.Part_Key, c.Plexus_Customer_No,
-                       SUM(CASE WHEN c.Location NOT LIKE '%TIJ%' OR c.Location IS NULL
-                                THEN c.Quantity ELSE 0 END) AS WIP_Quantity
+                       SUM(CASE WHEN op.Shippable = 1 THEN c.Quantity ELSE 0 END) AS Ready_Quantity,
+                       SUM(CASE WHEN op.Shippable = 0 THEN c.Quantity ELSE 0 END) AS WIP_Quantity
                 FROM Part_v_Container AS c
+                INNER JOIN Part_v_Part_Operation AS op
+                    ON c.Part_Operation_Key = op.Part_Operation_Key
+                   AND c.Part_Key = op.Part_Key
+                   AND c.Plexus_Customer_No = op.Plexus_Customer_No
+                INNER JOIN Part_v_Container_Status AS cs
+                    ON c.Container_Status = cs.Container_Status
+                   AND c.Plexus_Customer_No = cs.Plexus_Customer_No
                 WHERE c.Plexus_Customer_No = {PCN}
+                  AND c.Active = 1
                   AND c.Quantity > 0
+                  AND op.Active = 1
+                  AND cs.Allow_Ship = 1
+                  AND cs.Defective = 0
+                  AND cs.Scrap = 0
                 GROUP BY c.Part_Key, c.Plexus_Customer_No
-            ) AS wip
-                ON p.Part_Key = wip.Part_Key AND p.Plexus_Customer_No = wip.Plexus_Customer_No
+            ) AS inv
+                ON p.Part_Key = inv.Part_Key AND p.Plexus_Customer_No = inv.Plexus_Customer_No
             WHERE r.PCN = {PCN}
               {customer_filter}
               {status_filter}
               {balance_filter}
+              {date_filter}
+              {po_filter}
+              {part_filter}
+              {type_filter}
             ORDER BY Customer, r.Ship_Date {order_dir}, p.Part_No
         """
 
         conn = get_connection()
-        cursor = conn.cursor()
-        cursor.execute(query)
-        data = query_to_list(cursor)
-        conn.close()
-        return {"data": data}
+        try:
+            cursor = conn.cursor()
+            try:
+                cursor.execute(query)
+                data = query_to_list(cursor)
 
+                # A release can have several shippers. Resolve them separately
+                # so demand quantities and the number of releases stay unchanged.
+                release_keys = sorted({
+                    int(row["Release_Key"])
+                    for row in data if row.get("Release_Key") is not None
+                })
+                shippers_by_release = {}
+                batch_size = 75
+                for offset in range(0, len(release_keys), batch_size):
+                    keys = ", ".join(str(key) for key in release_keys[offset:offset + batch_size])
+                    shipper_query = f"""
+                        SELECT slr.Release_Key, s.Shipper_No
+                        FROM Sales_v_Shipper_Line_Release AS slr
+                        INNER JOIN Sales_v_Shipper_Line AS sl
+                            ON sl.Shipper_Line_Key = slr.Shipper_Line_Key
+                           AND sl.PCN = slr.PCN
+                        INNER JOIN Sales_v_Shipper AS s
+                            ON s.Shipper_Key = sl.Shipper_Key
+                           AND s.PCN = sl.PCN
+                        WHERE slr.PCN = {PCN}
+                          AND slr.Release_Key IN ({keys})
+                    """
+                    cursor.execute(shipper_query)
+                    for release_key, shipper_no in cursor.fetchall():
+                        if shipper_no is not None:
+                            shippers_by_release.setdefault(int(release_key), set()).add(str(shipper_no))
+
+                for row in data:
+                    release_key = row.pop("Release_Key", None)
+                    numbers = shippers_by_release.get(int(release_key), set()) if release_key is not None else set()
+                    row["Shipper_No"] = ", ".join(sorted(numbers))
+
+                return {"data": data}
+            finally:
+                cursor.close()
+        finally:
+            conn.close()
+
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
