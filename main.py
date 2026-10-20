@@ -576,13 +576,6 @@ def demand(req: DemandRequest):
         if part_keys:
             placeholders = ", ".join("?" for _ in part_keys)
             cursor.execute(f"""
-                WITH FinalOps AS (
-                    SELECT op.Part_Key, MAX(op.Operation_No) AS Final_Operation
-                    FROM Part_v_Part_Operation AS op
-                    WHERE op.Plexus_Customer_No = {PCN} AND op.Active = 1
-                      AND op.Part_Key IN ({placeholders})
-                    GROUP BY op.Part_Key
-                )
                 SELECT c.Part_Key,
                     SUM(CASE WHEN c.Container_Status IN ('OK', 'Loaded')
                                    AND op.Operation_No = fo.Final_Operation
@@ -594,7 +587,13 @@ def demand(req: DemandRequest):
                 LEFT JOIN Part_v_Part_Operation AS op
                     ON c.Part_Operation_Key = op.Part_Operation_Key
                     AND c.Plexus_Customer_No = op.Plexus_Customer_No
-                LEFT JOIN FinalOps AS fo ON c.Part_Key = fo.Part_Key
+                LEFT JOIN (
+                    SELECT op2.Part_Key, MAX(op2.Operation_No) AS Final_Operation
+                    FROM Part_v_Part_Operation AS op2
+                    WHERE op2.Plexus_Customer_No = {PCN}
+                      AND op2.Part_Key IN ({placeholders})
+                    GROUP BY op2.Part_Key
+                ) AS fo ON c.Part_Key = fo.Part_Key
                 WHERE c.Plexus_Customer_No = {PCN}
                   AND c.Active = 1 AND c.Quantity > 0
                   AND c.Part_Key IN ({placeholders})
