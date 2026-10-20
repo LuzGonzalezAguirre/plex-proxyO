@@ -520,7 +520,9 @@ def demand(req: DemandRequest):
         balance_filter = ""
         order_dir = "ASC"
 
-    date_filter = "AND r.Ship_Date >= ? AND r.Ship_Date < ?" if dates else ""
+    # Plex OpenAccess sometimes evaluates bound date strings unexpectedly.
+    # Filter the validated ship date range in Python after fetching releases.
+    date_filter = ""
     query = f"""
         SELECT
             r.Release_Key AS Release_Key,
@@ -565,8 +567,15 @@ def demand(req: DemandRequest):
     try:
         conn = get_connection()
         cursor = conn.cursor()
-        cursor.execute(query, *dates)
+        cursor.execute(query)
         rows = query_to_list(cursor)
+        if dates:
+            start_day, end_exclusive = dates
+            rows = [
+                row for row in rows
+                if row.get("Ship_Date") is not None
+                and start_day <= str(row["Ship_Date"])[:10] < end_exclusive
+            ]
 
         if not rows:
             return {"data": []}
