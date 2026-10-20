@@ -156,6 +156,8 @@ def make_revenue_forecast_router(get_connection, query_to_list, verify_token, pc
         if end < start or (end - start).days > 180:
             raise HTTPException(status_code=400, detail="Date range must be 0-180 days")
         exclusive = (end + timedelta(days=1)).strftime("%Y-%m-%d")
+        customer_clause = (f"AND i.Customer_No = {int(req.customer_no)}"
+                           if req.customer_no is not None else "")
         conn = None
         try:
             conn = get_connection()
@@ -172,6 +174,7 @@ def make_revenue_forecast_router(get_connection, query_to_list, verify_token, pc
                   AND i.Invoice_Date < '{exclusive}'
                   AND i.Void = 0
                   AND d.Account_No IN ('41000-420', '41000-470')
+                  {customer_clause}
                 GROUP BY d.Account_No ORDER BY d.Account_No
             """)
             return {"data": query_to_list(cursor)}
