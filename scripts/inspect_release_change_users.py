@@ -18,12 +18,18 @@ def main():
             if "user" in name.lower() and any(term in name.lower() for term in ("plex", "user", "employee")):
                 matches.append((str(table.table_schem or ""), name))
         print("Candidate user views:", len(matches))
-        for schema, name in matches[:35]:
+        priority = [
+            (schema, name) for schema, name in matches
+            if name.lower().startswith(("plexus_control_v_", "common_v_", "security_v_"))
+            and not name.lower().endswith("_e")
+        ]
+        print("Directory candidates:", len(priority))
+        for schema, name in priority:
             print("\nVIEW:", f"{schema}.{name}" if schema else name)
             try:
                 for c in cursor.columns(table=name, schema=schema or None):
                     n = str(c.column_name)
-                    if any(word in n.lower() for word in ("user", "employee", "name", "first", "last", "active")):
+                    if any(word in n.lower() for word in ("user", "employee", "name", "first", "last", "active", "login")):
                         print("  ", n, str(c.type_name))
             except Exception as exc:
                 print("  Column inspection failed:", type(exc).__name__)
