@@ -419,6 +419,8 @@ def bom_ctb(req: BomCtbRequest):
 class DemandRequest(BaseModel):
     customer_no: Optional[int] = None
     release_status: str = "Open"
+    start_date: Optional[str] = None
+    end_date: Optional[str] = None
 
 
 CUSTOMER_CASE = """
@@ -442,88 +444,174 @@ ALL_CUSTOMERS = "(332159, 768299, 768300, 338766, 332165, 332169, 332170, 773112
 MULTI_CUSTOMER = {768299: (768299, 768300)}
 
 
+def allocate_demand_inventory(releases: list[dict], inventory: dict) -> list[dict]:
+    """Allocate stock once per part and visible date/status selection.
+
+    Candidate matching Plex Customer Releases and Scheduling (Sep 2026).
+    Ready: active OK/Loaded at highest routing operation.
+    WIP: active OK at earlier operations. This does not fully replicate
+    the independent WIP pool observed for some Eaton releases.
+    """
+    remaining = {
+        key: {"ready": max(0, float(value["ready"])), "wip": max(0, float(value["wip"]))}
+        for key, value in inventory.items()
+    }
+    ordered = sorted(
+        releases,
+        key=lambda r: (str(r["Ship_Date"] or ""), int(r["Release_Key"])),
+    )
+    for row in ordered:
+        key = int(row["_Part_Key"])
+        available = remaining.setdefault(key, {"ready": 0.0, "wip": 0.0})
+        balance = max(0.0, float(row["Rel_Bal"] or 0))
+        ready = min(balance, available["ready"])
+        wip = min(balance - ready, available["wip"])
+        available["ready"] -= ready
+        available["wip"] -= wip
+        row["Qty_Ready"] = ready
+        row["Qty_WIP"] = wip
+
+    # Preserve the original display ordering and response shape.
+    for row in releases:
+        row.pop("_Part_Key", None)
+        row.pop("Release_Key", None)
+    return releases
+
+
 @app.post("/demand", dependencies=[Security(verify_token)])
 def demand(req: DemandRequest):
+    if (req.start_date is None) != (req.end_date is None):
+        raise HTTPException(status_code=400, detail="start_date y end_date deben enviarse juntos.")
+
+    dates = []
+    if req.start_date is not None:
+        try:
+            start = datetime.strptime(req.start_date, "%Y-%m-%d")
+            end = datetime.strptime(req.end_date, "%Y-%m-%d")
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Las fechas deben tener formato YYYY-MM-DD.")
+        if end < start:
+            raise HTTPException(status_code=400, detail="end_date anterior a start_date.")
+        if (end - start).days > 400:
+            raise HTTPException(status_code=400, detail="Rango maximo 400 dias.")
+        from datetime import timedelta
+        dates = [start.strftime("%Y-%m-%d"), (end + timedelta(days=1)).strftime("%Y-%m-%d")]
+
+    if req.customer_no is None:
+        customer_filter = f"AND po.Customer_No IN {ALL_CUSTOMERS}"
+    elif req.customer_no in MULTI_CUSTOMER:
+        nos = ', '.join(str(n) for n in MULTI_CUSTOMER[req.customer_no])
+        customer_filter = f"AND po.Customer_No IN ({nos})"
+    else:
+        customer_filter = f"AND po.Customer_No = {int(req.customer_no)}"
+
+    if req.release_status == "Open":
+        status_filter = "AND rs.Release_Status = 'Open'"
+        balance_filter = "AND (r.Quantity - ISNULL(r.Quantity_Shipped, 0)) > 0"
+        order_dir = "ASC"
+    elif req.release_status == "History":
+        status_filter = "AND rs.Release_Status IN ('Closed', 'Shipped')"
+        balance_filter = ""
+        order_dir = "DESC"
+    else:
+        status_filter = ""
+        balance_filter = ""
+        order_dir = "ASC"
+
+    date_filter = "AND r.Ship_Date >= ? AND r.Ship_Date < ?" if dates else ""
+    query = f"""
+        SELECT
+            r.Release_Key AS Release_Key,
+            pol.Part_Key AS _Part_Key,
+            {CUSTOMER_CASE} AS Customer,
+            ISNULL(po.PO_No, '') AS PO_Rel,
+            ISNULL(pos.PO_Status, 'Open') AS PO_Status,
+            ISNULL(r.Ship_To, '') AS Ship_To_Carrier,
+            p.Part_No + '.' + p.Revision AS Part_No_Rev,
+            ISNULL(cp.Customer_Part_No, '') AS Cust_Part,
+            r.Ship_Date AS Ship_Date,
+            r.Due_Date AS Due_Date,
+            r.Quantity AS Rel_Qty,
+            ISNULL(r.Quantity_Shipped, 0) AS Shipped,
+            r.Quantity - ISNULL(r.Quantity_Shipped, 0) AS Rel_Bal,
+            ISNULL(rs.Release_Status, 'Open') AS Rel_Status,
+            ISNULL(rt.Release_Type, 'Firm (862)') AS Rel_Type
+        FROM Sales_v_Release AS r
+        LEFT JOIN Sales_v_PO_Line AS pol
+            ON r.PO_Line_Key = pol.PO_Line_Key AND r.PCN = pol.PCN
+        LEFT JOIN Sales_v_PO AS po
+            ON pol.PO_Key = po.PO_Key AND r.PCN = po.PCN
+        LEFT JOIN Sales_v_PO_Status AS pos
+            ON po.PO_Status_Key = pos.PO_Status_Key AND r.PCN = pos.PCN
+        LEFT JOIN Sales_v_Release_Status AS rs
+            ON r.Release_Status_Key = rs.Release_Status_Key AND r.PCN = rs.PCN
+        LEFT JOIN Sales_v_Release_Type AS rt
+            ON r.Release_Type_Key = rt.Release_Type_Key AND r.PCN = rt.PCN
+        LEFT JOIN Part_v_Part AS p
+            ON pol.Part_Key = p.Part_Key AND r.PCN = p.Plexus_Customer_No
+        LEFT JOIN Part_v_Customer_Part AS cp
+            ON pol.Customer_Part_Key = cp.Customer_Part_Key AND r.PCN = cp.Plexus_Customer_No
+        WHERE r.PCN = {PCN}
+          {customer_filter}
+          {status_filter}
+          {balance_filter}
+          {date_filter}
+        ORDER BY Customer, r.Ship_Date {order_dir}, p.Part_No, r.Release_Key
+    """
+
+    conn = None
     try:
-        if req.customer_no is None:
-            customer_filter = f"AND po.Customer_No IN {ALL_CUSTOMERS}"
-        elif req.customer_no in MULTI_CUSTOMER:
-            nos = ', '.join(str(n) for n in MULTI_CUSTOMER[req.customer_no])
-            customer_filter = f"AND po.Customer_No IN ({nos})"
-        else:
-            customer_filter = f"AND po.Customer_No = {req.customer_no}"
-
-        if req.release_status == "Open":
-            status_filter  = "AND rs.Release_Status = 'Open'"
-            balance_filter = "AND (r.Quantity - ISNULL(r.Quantity_Shipped, 0)) > 0"
-            order_dir      = "ASC"
-        elif req.release_status == "History":
-            status_filter  = "AND rs.Release_Status IN ('Closed', 'Shipped')"
-            balance_filter = ""
-            order_dir      = "DESC"
-        else:
-            status_filter  = ""
-            balance_filter = ""
-            order_dir      = "ASC"
-
-        query = f"""
-            SELECT
-                {CUSTOMER_CASE}                                         AS Customer,
-                ISNULL(po.PO_No, '')                                    AS PO_Rel,
-                ISNULL(pos.PO_Status, 'Open')                           AS PO_Status,
-                ISNULL(r.Ship_To, '')                                   AS Ship_To_Carrier,
-                p.Part_No + '.' + p.Revision                           AS Part_No_Rev,
-                ISNULL(cp.Customer_Part_No, '')                         AS Cust_Part,
-                r.Quantity - ISNULL(r.Quantity_Shipped, 0)             AS Qty_Ready,
-                ISNULL(wip.WIP_Quantity, 0)                             AS Qty_WIP,
-                r.Ship_Date                                             AS Ship_Date,
-                r.Due_Date                                              AS Due_Date,
-                r.Quantity                                              AS Rel_Qty,
-                ISNULL(r.Quantity_Shipped, 0)                           AS Shipped,
-                r.Quantity - ISNULL(r.Quantity_Shipped, 0)             AS Rel_Bal,
-                ISNULL(rs.Release_Status, 'Open')                       AS Rel_Status,
-                ISNULL(rt.Release_Type, 'Firm (862)')                   AS Rel_Type
-            FROM Sales_v_Release AS r
-            LEFT JOIN Sales_v_PO_Line AS pol
-                ON r.PO_Line_Key = pol.PO_Line_Key AND r.PCN = pol.PCN
-            LEFT JOIN Sales_v_PO AS po
-                ON pol.PO_Key = po.PO_Key AND r.PCN = po.PCN
-            LEFT JOIN Sales_v_PO_Status AS pos
-                ON po.PO_Status_Key = pos.PO_Status_Key AND r.PCN = pos.PCN
-            LEFT JOIN Sales_v_Release_Status AS rs
-                ON r.Release_Status_Key = rs.Release_Status_Key AND r.PCN = rs.PCN
-            LEFT JOIN Sales_v_Release_Type AS rt
-                ON r.Release_Type_Key = rt.Release_Type_Key AND r.PCN = rt.PCN
-            LEFT JOIN Part_v_Part AS p
-                ON pol.Part_Key = p.Part_Key AND r.PCN = p.Plexus_Customer_No
-            LEFT JOIN Part_v_Customer_Part AS cp
-                ON pol.Customer_Part_Key = cp.Customer_Part_Key AND r.PCN = cp.Plexus_Customer_No
-            LEFT JOIN (
-                SELECT c.Part_Key, c.Plexus_Customer_No,
-                       SUM(CASE WHEN c.Location NOT LIKE '%TIJ%' OR c.Location IS NULL
-                                THEN c.Quantity ELSE 0 END) AS WIP_Quantity
-                FROM Part_v_Container AS c
-                WHERE c.Plexus_Customer_No = {PCN}
-                  AND c.Quantity > 0
-                GROUP BY c.Part_Key, c.Plexus_Customer_No
-            ) AS wip
-                ON p.Part_Key = wip.Part_Key AND p.Plexus_Customer_No = wip.Plexus_Customer_No
-            WHERE r.PCN = {PCN}
-              {customer_filter}
-              {status_filter}
-              {balance_filter}
-            ORDER BY Customer, r.Ship_Date {order_dir}, p.Part_No
-        """
-
         conn = get_connection()
         cursor = conn.cursor()
-        cursor.execute(query)
-        data = query_to_list(cursor)
-        conn.close()
-        return {"data": data}
+        cursor.execute(query, *dates)
+        rows = query_to_list(cursor)
 
+        if not rows:
+            return {"data": []}
+
+        part_keys = sorted({int(r["_Part_Key"]) for r in rows if r["_Part_Key"] is not None})
+        stock = {}
+        if part_keys:
+            placeholders = ", ".join("?" for _ in part_keys)
+            cursor.execute(f"""
+                WITH FinalOps AS (
+                    SELECT op.Part_Key, MAX(op.Operation_No) AS Final_Operation
+                    FROM Part_v_Part_Operation AS op
+                    WHERE op.Plexus_Customer_No = {PCN} AND op.Active = 1
+                      AND op.Part_Key IN ({placeholders})
+                    GROUP BY op.Part_Key
+                )
+                SELECT c.Part_Key,
+                    SUM(CASE WHEN c.Container_Status IN ('OK', 'Loaded')
+                                   AND op.Operation_No = fo.Final_Operation
+                             THEN c.Quantity ELSE 0 END) AS Ready_Stock,
+                    SUM(CASE WHEN c.Container_Status = 'OK'
+                                   AND op.Operation_No < fo.Final_Operation
+                             THEN c.Quantity ELSE 0 END) AS WIP_Stock
+                FROM Part_v_Container AS c
+                LEFT JOIN Part_v_Part_Operation AS op
+                    ON c.Part_Operation_Key = op.Part_Operation_Key
+                    AND c.Plexus_Customer_No = op.Plexus_Customer_No
+                LEFT JOIN FinalOps AS fo ON c.Part_Key = fo.Part_Key
+                WHERE c.Plexus_Customer_No = {PCN}
+                  AND c.Active = 1 AND c.Quantity > 0
+                  AND c.Part_Key IN ({placeholders})
+                GROUP BY c.Part_Key
+            """, *(part_keys + part_keys))
+            for part_key, ready, wip in cursor.fetchall():
+                stock[int(part_key)] = {
+                    "ready": float(ready or 0), "wip": float(wip or 0)
+                }
+
+        result = allocate_demand_inventory(rows, stock)
+        return {"data": result}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if conn is not None:
+            conn.close()
 
 
 # ─── Shift range helper ───────────────────────────────────────────────────────
