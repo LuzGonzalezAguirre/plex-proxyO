@@ -474,7 +474,6 @@ def allocate_demand_inventory(releases: list[dict], inventory: dict) -> list[dic
     # Preserve the original display ordering and response shape.
     for row in releases:
         row.pop("_Part_Key", None)
-        row.pop("Release_Key", None)
     return releases
 
 
