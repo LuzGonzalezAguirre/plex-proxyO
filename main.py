@@ -580,6 +580,53 @@ def demand(req: DemandRequest):
         if not rows:
             return {"data": []}
 
+        # Release history belongs to each Release_Key. Query in small batches
+        # to avoid OpenAccess's limit on bound parameters.
+        change_by_release = {}
+        release_keys = sorted({int(row["Release_Key"]) for row in rows})
+        for offset in range(0, len(release_keys), 100):
+            batch = release_keys[offset:offset + 100]
+            numeric_keys = ", ".join(str(key) for key in batch)
+            cursor.execute(f"""
+                SELECT ch.Release_Key, ch.Change_Key, ch.Change_Date,
+                       ch.Change_By, ch.Note
+                FROM Sales_v_Release_Change AS ch
+                WHERE ch.Release_Key IN ({numeric_keys})
+            """)
+            for release_key, change_key, change_date, change_by, note in cursor.fetchall():
+                key = int(release_key)
+                order = (str(change_date or ""), int(change_key or 0))
+                prior = change_by_release.get(key)
+                if prior is None or order > prior[0]:
+                    change_by_release[key] = (order, change_by, note)
+
+        user_names = {}
+        user_ids = sorted({
+            int(change[1]) for change in change_by_release.values()
+            if change[1] is not None
+        })
+        for offset in range(0, len(user_ids), 100):
+            batch = user_ids[offset:offset + 100]
+            numeric_users = ", ".join(str(key) for key in batch)
+            cursor.execute(f"""
+                SELECT pu.Plexus_User_No, pu.First_Name, pu.Last_Name
+                FROM Plexus_Control_v_Plexus_User AS pu
+                WHERE pu.Plexus_User_No IN ({numeric_users})
+            """)
+            for user_no, first_name, last_name in cursor.fetchall():
+                user_names[int(user_no)] = " ".join(
+                    part.strip() for part in (first_name or "", last_name or "")
+                    if part and part.strip()
+                )
+
+        for row in rows:
+            latest = change_by_release.get(int(row["Release_Key"]))
+            row["Changed_By"] = (
+                user_names.get(int(latest[1]), "") if latest and latest[1] is not None
+                else ""
+            )
+            row["Note"] = str(latest[2] or "") if latest else ""
+
         part_keys = sorted({int(r["_Part_Key"]) for r in rows if r["_Part_Key"] is not None})
         stock = {}
         if part_keys:
