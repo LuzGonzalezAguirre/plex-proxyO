@@ -10,6 +10,7 @@ from dotenv import load_dotenv
 from oee_router import router as oee_router_router
 from shelf_life_router import make_shelf_life_router
 from delivery_performance_router import make_delivery_performance_router
+from revenue_forecast_router import make_revenue_forecast_router
 
 load_dotenv()
 
@@ -59,6 +60,7 @@ def query_to_list(cursor) -> list[dict]:
 
 app.include_router(make_shelf_life_router(get_connection, query_to_list, verify_token))
 app.include_router(make_delivery_performance_router(get_connection, query_to_list, verify_token))
+app.include_router(make_revenue_forecast_router(get_connection, query_to_list, verify_token, PCN))
 
 # ─── Health ───────────────────────────────────────────────────────────────────
 
