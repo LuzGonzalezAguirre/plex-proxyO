@@ -419,6 +419,7 @@ def bom_ctb(req: BomCtbRequest):
 class DemandRequest(BaseModel):
     customer_no: Optional[int] = None
     release_status: str = "Open"
+    include_all_customers: bool = False
     start_date: Optional[str] = None
     end_date: Optional[str] = None
 
@@ -496,7 +497,9 @@ def demand(req: DemandRequest):
         from datetime import timedelta
         dates = [start.strftime("%Y-%m-%d"), (end + timedelta(days=1)).strftime("%Y-%m-%d")]
 
-    if req.customer_no is None:
+    if req.include_all_customers and req.customer_no is None:
+        customer_filter = ""
+    elif req.customer_no is None:
         customer_filter = f"AND po.Customer_No IN {ALL_CUSTOMERS}"
     elif req.customer_no in MULTI_CUSTOMER:
         nos = ', '.join(str(n) for n in MULTI_CUSTOMER[req.customer_no])
