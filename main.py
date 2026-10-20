@@ -574,7 +574,9 @@ def demand(req: DemandRequest):
         part_keys = sorted({int(r["_Part_Key"]) for r in rows if r["_Part_Key"] is not None})
         stock = {}
         if part_keys:
-            placeholders = ", ".join("?" for _ in part_keys)
+            # Part keys originate from Plex and are explicitly converted to int.
+            # Avoid hundreds of ODBC positional params (OpenAccess @param limit).
+            part_key_list = ", ".join(str(key) for key in part_keys)
             cursor.execute(f"""
                 SELECT c.Part_Key,
                     SUM(CASE WHEN c.Container_Status IN ('OK', 'Loaded')
@@ -591,14 +593,14 @@ def demand(req: DemandRequest):
                     SELECT op2.Part_Key, MAX(op2.Operation_No) AS Final_Operation
                     FROM Part_v_Part_Operation AS op2
                     WHERE op2.Plexus_Customer_No = {PCN}
-                      AND op2.Part_Key IN ({placeholders})
+                      AND op2.Part_Key IN ({part_key_list})
                     GROUP BY op2.Part_Key
                 ) AS fo ON c.Part_Key = fo.Part_Key
                 WHERE c.Plexus_Customer_No = {PCN}
                   AND c.Active = 1 AND c.Quantity > 0
-                  AND c.Part_Key IN ({placeholders})
+                  AND c.Part_Key IN ({part_key_list})
                 GROUP BY c.Part_Key
-            """, *(part_keys + part_keys))
+            """)
             for part_key, ready, wip in cursor.fetchall():
                 stock[int(part_key)] = {
                     "ready": float(ready or 0), "wip": float(wip or 0)
