@@ -146,4 +146,41 @@ def make_revenue_forecast_router(get_connection, query_to_list, verify_token, pc
             if conn is not None:
                 conn.close()
 
+    @router.post("/shipping-revenue-summary", dependencies=[Security(verify_token)])
+    def shipping_revenue_summary(req: RevenueForecastRequest):
+        try:
+            start = datetime.strptime(req.start_date, "%Y-%m-%d")
+            end = datetime.strptime(req.end_date, "%Y-%m-%d")
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Dates must use YYYY-MM-DD")
+        if end < start or (end - start).days > 180:
+            raise HTTPException(status_code=400, detail="Date range must be 0-180 days")
+        exclusive = (end + timedelta(days=1)).strftime("%Y-%m-%d")
+        conn = None
+        try:
+            conn = get_connection()
+            cursor = conn.cursor()
+            cursor.execute(f"""
+                SELECT d.Account_No, COUNT(*) AS Total_Lines,
+                       SUM(d.Credit - d.Debit) AS Revenue
+                FROM Accounting_v_AR_Invoice AS i
+                INNER JOIN Accounting_v_AR_Invoice_Dist AS d
+                  ON i.Invoice_Link = d.Invoice_Link
+                  AND i.Plexus_Customer_No = d.Plexus_Customer_No
+                WHERE i.Plexus_Customer_No = {pcn}
+                  AND i.Invoice_Date >= '{req.start_date}'
+                  AND i.Invoice_Date < '{exclusive}'
+                  AND i.Void = 0
+                  AND d.Account_No IN ('41000-420', '41000-470')
+                GROUP BY d.Account_No ORDER BY d.Account_No
+            """)
+            return {"data": query_to_list(cursor)}
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc))
+        finally:
+            if conn is not None:
+                conn.close()
+
     return router
