@@ -603,7 +603,7 @@ def demand(req: DemandRequest):
         user_names = {}
         user_ids = sorted({
             int(change[1]) for change in change_by_release.values()
-            if change[1] is not None
+            if change[1] is not None and int(change[1]) > 0
         })
         for offset in range(0, len(user_ids), 100):
             batch = user_ids[offset:offset + 100]
@@ -621,10 +621,12 @@ def demand(req: DemandRequest):
 
         for row in rows:
             latest = change_by_release.get(int(row["Release_Key"]))
-            row["Changed_By"] = (
-                user_names.get(int(latest[1]), "") if latest and latest[1] is not None
-                else ""
-            )
+            if not latest:
+                row["Changed_By"] = ""
+            elif latest[1] is None or int(latest[1]) == 0:
+                row["Changed_By"] = "System"
+            else:
+                row["Changed_By"] = user_names.get(int(latest[1]), "Sin identificar")
             row["Note"] = str(latest[2] or "") if latest else ""
 
         part_keys = sorted({int(r["_Part_Key"]) for r in rows if r["_Part_Key"] is not None})
