@@ -114,7 +114,9 @@ def make_revenue_forecast_router(get_connection, query_to_list, verify_token, pc
                 # Non-unitary Price_Conversion is flagged as unresolved.
                 conversion = Decimal(str(row["Price_Conversion"] or 1))
                 currency = int(chosen["Currency_Key"] or 0) if chosen else None
-                valid = chosen is not None and conversion == 1 and currency == 0
+                price_unit = str(chosen["Unit"] or "").strip().lower() if chosen else ""
+                valid = (chosen is not None and conversion == 1 and currency == 0
+                         and price_unit in ("ea", "each"))
                 unit_price = Decimal(str(chosen["Price"])) if valid else None
                 result.append({
                     "Release_Key": int(row["Release_Key"]),
@@ -135,7 +137,7 @@ def make_revenue_forecast_router(get_connection, query_to_list, verify_token, pc
                     "Price_Source": "PO" if valid else "Unresolved",
                     "Price_Issue": (None if valid else
                         "No applicable PO price" if chosen is None else
-                        "Price conversion or currency requires verification"),
+                        "Price unit, conversion or currency requires verification"),
                 })
             return {"data": result}
         except HTTPException:
