@@ -14,7 +14,7 @@ class RevenueForecastRequest(BaseModel):
     start_date: str
     end_date: str
     customer_no: int | None = None
-    release_status: str = "All"
+    release_status: str = "Active"
     debug: bool = False
 
 def make_revenue_forecast_router(get_connection, query_to_list, verify_token, pcn=306713):
@@ -29,14 +29,15 @@ def make_revenue_forecast_router(get_connection, query_to_list, verify_token, pc
             raise HTTPException(status_code=400, detail="Dates must use YYYY-MM-DD")
         if end < start or (end - start).days > 180:
             raise HTTPException(status_code=400, detail="Date range must be 0-180 days")
-        if req.release_status not in ("All", "Open", "History"):
-            raise HTTPException(status_code=400, detail="Invalid release status")
+        if req.release_status not in ("Active", "All", "Open"):
+            raise HTTPException(status_code=400, detail="Revenue Forecast only supports active releases")
 
         customer_filter = (f"AND po.Customer_No = {int(req.customer_no)}"
                            if req.customer_no is not None else "")
-        status_filter = ("AND rs.Release_Status = 'Open'" if req.release_status == "Open"
-                         else "AND rs.Release_Status IN ('Closed', 'Shipped')"
-                         if req.release_status == "History" else "")
+        # Revenue Forecast uses active demand only, irrespective of legacy status.
+        # Explicitly exclude historical, shipped and cancelled releases.
+        status_filter = ("AND rs.Release_Status IN ('Open', 'Scheduled')"
+                         " AND rt.Release_Type IN ('Firm (862)', 'Forecast', 'HOLD')")
         conn = None
         try:
             conn = get_connection()
@@ -70,7 +71,9 @@ def make_revenue_forecast_router(get_connection, query_to_list, verify_token, pc
             """)
             releases = query_to_list(cursor)
             selected = [r for r in releases if r["Ship_Date"] is not None
-                        and req.start_date <= str(r["Ship_Date"])[:10] <= req.end_date]
+                        and req.start_date <= str(r["Ship_Date"])[:10] <= req.end_date
+                        and str(r["Rel_Status"] or "").strip().lower() in ("open", "scheduled")
+                        and str(r["Release_Type"] or "").strip().lower() in ("firm (862)", "forecast", "hold")]
             if not selected:
                 return {"data": []}
 
