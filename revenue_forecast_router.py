@@ -28,14 +28,15 @@ def make_revenue_forecast_router(get_connection, query_to_list, verify_token, pc
             raise HTTPException(status_code=400, detail="Dates must use YYYY-MM-DD")
         if end < start or (end - start).days > 180:
             raise HTTPException(status_code=400, detail="Date range must be 0-180 days")
-        if req.release_status not in ("Active", "All", "Open"):
+        if req.release_status not in ("Active", "All", "Open", "LegacyAll"):
             raise HTTPException(status_code=400, detail="Revenue Forecast only supports active releases")
 
         customer_filter = (f"AND po.Customer_No = {int(req.customer_no)}"
                            if req.customer_no is not None else "")
         # Revenue Forecast uses active demand only, irrespective of legacy status.
         # Explicitly exclude historical, shipped and cancelled releases.
-        status_filter = ("AND rs.Release_Status IN ('Open', 'Scheduled')"
+        status_filter = ("" if req.release_status == "LegacyAll" and req.debug else
+                         "AND rs.Release_Status IN ('Open', 'Scheduled')"
                          " AND rt.Release_Type IN ('Firm (862)', 'Forecast', 'HOLD')")
         conn = None
         try:
@@ -71,8 +72,9 @@ def make_revenue_forecast_router(get_connection, query_to_list, verify_token, pc
             releases = query_to_list(cursor)
             selected = [r for r in releases if r["Ship_Date"] is not None
                         and req.start_date <= str(r["Ship_Date"])[:10] <= req.end_date
-                        and str(r["Rel_Status"] or "").strip().lower() in ("open", "scheduled")
-                        and str(r["Release_Type"] or "").strip().lower() in ("firm (862)", "forecast", "hold")]
+                        and (req.release_status == "LegacyAll" and req.debug or (
+                            str(r["Rel_Status"] or "").strip().lower() in ("open", "scheduled")
+                            and str(r["Release_Type"] or "").strip().lower() in ("firm (862)", "forecast", "hold")))]
             if not selected:
                 return {"data": []}
 
