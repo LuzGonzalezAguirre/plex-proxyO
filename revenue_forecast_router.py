@@ -8,7 +8,6 @@ from decimal import Decimal
 from fastapi import APIRouter, HTTPException, Security
 from pydantic import BaseModel
 from revenue_release_audit import annotate_release_coincidences
-from revenue_edi_assessment import attach_edi_history
 
 class RevenueForecastRequest(BaseModel):
     start_date: str
@@ -195,7 +194,6 @@ def make_revenue_forecast_router(get_connection, query_to_list, verify_token, pc
                 })
             if req.debug:
                 annotate_release_coincidences(result)
-                attach_edi_history(cursor, query_to_list, result)
             return {"data": result}
         except HTTPException:
             raise
