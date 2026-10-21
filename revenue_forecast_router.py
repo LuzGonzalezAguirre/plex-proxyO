@@ -13,6 +13,7 @@ class RevenueForecastRequest(BaseModel):
     end_date: str
     customer_no: int | None = None
     release_status: str = "All"
+    debug: bool = False
 
 def make_revenue_forecast_router(get_connection, query_to_list, verify_token, pcn=306713):
     router = APIRouter()
@@ -93,17 +94,35 @@ def make_revenue_forecast_router(get_connection, query_to_list, verify_token, pc
                 quantity = Decimal(str(row["Rel_Qty"] or 0))
                 balance = Decimal(str(row["Rel_Bal"] or 0))
                 applicable = []
+                candidate_debug = []
                 for price in prices.get(int(row["PO_Line_Key"]), []):
-                    if price["Active"] != 1 or price["Price"] is None:
-                        continue
+                    reasons = []
+                    if price["Active"] != 1:
+                        reasons.append("inactive")
+                    if price["Price"] is None:
+                        reasons.append("missing_price")
                     if price["Effective_Date"] and str(price["Effective_Date"])[:10] > ship_date:
-                        continue
+                        reasons.append("not_yet_effective")
                     if price["Expiration_Date"] and str(price["Expiration_Date"])[:10] < ship_date:
-                        continue
-                    # A breakpoint price requires validated tier semantics.
+                        reasons.append("expired")
                     if Decimal(str(price["Breakpoint_Quantity"] or 0)) != 0:
-                        continue
-                    applicable.append(price)
+                        reasons.append("tier_not_supported")
+                    if req.debug:
+                        candidate_debug.append({
+                            "Price_Key": price["Price_Key"],
+                            "Price": float(price["Price"]) if price["Price"] is not None else None,
+                            "Active": price["Active"],
+                            "Effective_Date": price["Effective_Date"],
+                            "Expiration_Date": price["Expiration_Date"],
+                            "Breakpoint_Quantity": price["Breakpoint_Quantity"],
+                            "Unit": price["Unit"],
+                            "Currency_Key": price["Currency_Key"],
+                            "Primary_Price": price["Primary_Price"],
+                            "Selection_Status": "eligible" if not reasons else "excluded",
+                            "Exclusion_Reasons": reasons,
+                        })
+                    if not reasons:
+                        applicable.append(price)
                 applicable.sort(key=lambda p: (
                     str(p["Effective_Date"] or ""),
                     int(p["Primary_Price"] or 0),
@@ -138,6 +157,36 @@ def make_revenue_forecast_router(get_connection, query_to_list, verify_token, pc
                     "Price_Issue": (None if valid else
                         "No applicable PO price" if chosen is None else
                         "Price unit, conversion or currency requires verification"),
+                    **({"Debug": {
+                        "Field_Sources": {
+                            "Release_Key": "Sales_v_Release.Release_Key",
+                            "PO_Line_Key": "Sales_v_Release.PO_Line_Key",
+                            "Part_Key": "Sales_v_PO_Line.Part_Key",
+                            "Customer_No": "Sales_v_PO.Customer_No",
+                            "PO_No": "Sales_v_PO.PO_No",
+                            "Part_No_Rev": "Part_v_Part.Part_No + Revision",
+                            "Release_Type": "Sales_v_Release_Type.Release_Type",
+                            "Ship_Date": "Sales_v_Release.Ship_Date",
+                            "Rel_Qty": "Sales_v_Release.Quantity",
+                            "Shipped": "Sales_v_Release.Quantity_Shipped",
+                            "Rel_Bal": "Quantity - Quantity_Shipped",
+                            "Unit_Price": "Sales_v_Price.Price",
+                            "Price_Key": "Sales_v_Price.Price_Key",
+                            "Price_Conversion": "Sales_v_PO_Line.Price_Conversion",
+                        },
+                        "Price_Conversion_Raw": row["Price_Conversion"],
+                        "Price_Conversion_Applied": float(conversion),
+                        "Currency_Key": currency,
+                        "Price_Unit": chosen["Unit"] if chosen else None,
+                        "Candidate_Count": len(candidate_debug),
+                        "Eligible_Count": len(applicable),
+                        "Candidates": candidate_debug,
+                        "Selected_Price_Key": chosen["Price_Key"] if chosen else None,
+                        "Selection_Rule": "Active, effective <= ship date, unexpired, zero breakpoint; newest effective date, primary, price key",
+                        "Forecast_Formula": "Sales_v_Release.Quantity * Sales_v_Price.Price",
+                        "Remaining_Formula": "(Quantity - Quantity_Shipped) * Sales_v_Price.Price",
+                        "Revenue_Price_Validated": valid,
+                    }} if req.debug else {}),
                 })
             return {"data": result}
         except HTTPException:
