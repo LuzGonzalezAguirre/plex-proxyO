@@ -22,6 +22,7 @@ from collections import Counter, defaultdict
 from datetime import datetime
 from decimal import Decimal
 from itertools import combinations
+from heapq import nsmallest
 from pathlib import Path
 import sys
 
@@ -122,29 +123,32 @@ def build_audit(rows, reference_gap):
         c for c in candidates
         if c["Remaining_Revenue"] is not None and amount(c["Remaining_Revenue"]) > ZERO
     ]
-    matches = []
-    for group in combinations(priced_candidates, 1):
-        subtotal = sum((amount(x["Remaining_Revenue"]) for x in group), ZERO)
-        matches.append({
-            "Release_Keys": str(group[0]["Release_Key"]),
-            "Count": 1,
-            "Candidate_Remaining": str(subtotal),
-            "Absolute_Distance_To_Gap": str(abs(subtotal - reference_gap)),
-            "Reason": group[0]["Review_Flags"],
-        })
-    for group in combinations(priced_candidates, 2):
-        if str(group[0]["Release_Key"]) == str(group[1]["Release_Key"]):
-            continue
-        subtotal = sum((amount(x["Remaining_Revenue"]) for x in group), ZERO)
-        matches.append({
-            "Release_Keys": "|".join(str(x["Release_Key"]) for x in group),
-            "Count": 2,
-            "Candidate_Remaining": str(subtotal),
-            "Absolute_Distance_To_Gap": str(abs(subtotal - reference_gap)),
-            "Reason": "Arithmetic lead only; both releases require independent review",
-        })
-    matches.sort(key=lambda x: amount(x["Absolute_Distance_To_Gap"]))
-    return ledger, candidates, overlap_groups, matches[:25]
+    def possible_matches():
+        for group in combinations(priced_candidates, 1):
+            subtotal = sum((amount(x["Remaining_Revenue"]) for x in group), ZERO)
+            yield {
+                "Release_Keys": str(group[0]["Release_Key"]),
+                "Count": 1,
+                "Candidate_Remaining": str(subtotal),
+                "Absolute_Distance_To_Gap": str(abs(subtotal - reference_gap)),
+                "Reason": group[0]["Review_Flags"],
+            }
+        for group in combinations(priced_candidates, 2):
+            if str(group[0]["Release_Key"]) == str(group[1]["Release_Key"]):
+                continue
+            subtotal = sum((amount(x["Remaining_Revenue"]) for x in group), ZERO)
+            yield {
+                "Release_Keys": "|".join(str(x["Release_Key"]) for x in group),
+                "Count": 2,
+                "Candidate_Remaining": str(subtotal),
+                "Absolute_Distance_To_Gap": str(abs(subtotal - reference_gap)),
+                "Reason": "Arithmetic lead only; both releases require independent review",
+            }
+    # Stream matches: never materialize an unbounded O(n^2) list in memory.
+    matches = nsmallest(
+        25, possible_matches(), key=lambda x: amount(x["Absolute_Distance_To_Gap"])
+    )
+    return ledger, candidates, overlap_groups, matches
 
 
 def main():
