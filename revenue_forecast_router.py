@@ -263,7 +263,7 @@ def make_revenue_forecast_router(get_connection, query_to_list, verify_token, pc
             conn = get_connection()
             cursor = conn.cursor()
             cursor.execute(f"""
-                SELECT CAST(i.Invoice_Date AS DATE) AS Invoice_Date,
+                SELECT i.Invoice_Date AS Invoice_Date,
                        d.Account_No,
                        COUNT(*) AS Total_Lines,
                        SUM(d.Credit - d.Debit) AS Revenue
@@ -277,10 +277,19 @@ def make_revenue_forecast_router(get_connection, query_to_list, verify_token, pc
                   AND i.Void = 0
                   AND d.Account_No IN ('41000-420', '41000-470')
                   {customer_clause}
-                GROUP BY CAST(i.Invoice_Date AS DATE), d.Account_No
+                GROUP BY i.Invoice_Date, d.Account_No
                 ORDER BY Invoice_Date, d.Account_No
             """)
-            return {"data": query_to_list(cursor)}
+            values = {}
+            for record in query_to_list(cursor):
+                raw_date = record["Invoice_Date"]
+                day = raw_date[:10] if isinstance(raw_date, str) else raw_date.strftime("%Y-%m-%d")
+                key = (day, str(record["Account_No"]))
+                if key not in values:
+                    values[key] = {"Invoice_Date": day, "Account_No": key[1], "Total_Lines": 0, "Revenue": Decimal("0")}
+                values[key]["Total_Lines"] += int(record["Total_Lines"] or 0)
+                values[key]["Revenue"] += Decimal(str(record["Revenue"] or 0))
+            return {"data": [values[key] for key in sorted(values)]}
         except HTTPException:
             raise
         except Exception as exc:
