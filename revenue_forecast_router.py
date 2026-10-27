@@ -298,4 +298,67 @@ def make_revenue_forecast_router(get_connection, query_to_list, verify_token, pc
             if conn is not None:
                 conn.close()
 
+    @router.post("/shipping-revenue-detail", dependencies=[Security(verify_token)])
+    def shipping_revenue_detail(req: RevenueForecastRequest):
+        """Read-only invoice distribution lines for reconciliation, without grouping.
+
+        Uses exactly the account, PCN, date, void and optional customer filters
+        used by /shipping-revenue-summary and /shipping-revenue-daily.
+        Keep the date window small to avoid an unbounded diagnostic response.
+        """
+        try:
+            start = datetime.strptime(req.start_date, "%Y-%m-%d")
+            end = datetime.strptime(req.end_date, "%Y-%m-%d")
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Dates must use YYYY-MM-DD")
+        if end < start or (end - start).days > 7:
+            raise HTTPException(status_code=400, detail="Detail date range must be 0-7 days")
+        exclusive = (end + timedelta(days=1)).strftime("%Y-%m-%d")
+        customer_clause = (f"AND i.Customer_No = {int(req.customer_no)}"
+                           if req.customer_no is not None else "")
+        conn = None
+        try:
+            conn = get_connection()
+            cursor = conn.cursor()
+            cursor.execute(f"""
+                SELECT i.Invoice_Link,
+                       i.Invoice_Date,
+                       d.Account_No,
+                       d.Credit,
+                       d.Debit
+                FROM Accounting_v_AR_Invoice AS i
+                INNER JOIN Accounting_v_AR_Invoice_Dist AS d
+                  ON i.Invoice_Link = d.Invoice_Link
+                  AND i.Plexus_Customer_No = d.Plexus_Customer_No
+                WHERE i.Plexus_Customer_No = {pcn}
+                  AND i.Invoice_Date >= '{req.start_date}'
+                  AND i.Invoice_Date < '{exclusive}'
+                  AND i.Void = 0
+                  AND d.Account_No IN ('41000-420', '41000-470')
+                  {customer_clause}
+                ORDER BY i.Invoice_Date, i.Invoice_Link, d.Account_No
+            """)
+            results = []
+            for record in query_to_list(cursor):
+                raw_date = record["Invoice_Date"]
+                day = raw_date[:10] if isinstance(raw_date, str) else raw_date.strftime("%Y-%m-%d")
+                credit = Decimal(str(record["Credit"] or 0))
+                debit = Decimal(str(record["Debit"] or 0))
+                results.append({
+                    "Invoice_Link": record["Invoice_Link"],
+                    "Invoice_Date": day,
+                    "Account_No": record["Account_No"],
+                    "Credit": credit,
+                    "Debit": debit,
+                    "Revenue": credit - debit,
+                })
+            return {"data": results}
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc))
+        finally:
+            if conn is not None:
+                conn.close()
+
     return router
