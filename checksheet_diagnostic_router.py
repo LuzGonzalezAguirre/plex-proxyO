@@ -302,10 +302,14 @@ ORDER BY wl.Log_Date DESC
             section_id = requirement["Section_ID"]
             matching = by_section.get(section_id, [])
             if req.operation_job_op_keys is not None:
-                operation_job_key = req.operation_job_op_keys.get(requirement["Operation_Number"])
+                # Plex can record sections from many Control Plan operations
+                # using the currently executing Job_Op_Key (e.g. op 905).
+                # Treat mapping values as allowed capturing job operations,
+                # never demand a 1:1 section-operation correspondence.
+                allowed_capturing_jobs = set(req.operation_job_op_keys.values())
                 matching = [
                     record for record in matching
-                    if operation_job_key is not None and record["Job_Operation_ID"] == operation_job_key
+                    if record["Job_Operation_ID"] in allowed_capturing_jobs
                 ]
             last = max(
                 (r for r in matching if r["Inspection_Date"] is not None),
@@ -350,6 +354,7 @@ ORDER BY wl.Log_Date DESC
                 "control_plan_key": req.control_plan_key,
                 "job_op_key": req.job_op_key,
                 "operation_job_op_keys": req.operation_job_op_keys,
+                "capture_job_op_scoping": "UNION_OF_SUPPLIED_CAPTURING_JOB_OP_KEYS",
                 "operation_numbers": req.operation_numbers,
                 "requirements_returned": len(output),
                 "timer_hypothesis_only": True,
@@ -375,6 +380,7 @@ ORDER BY wl.Log_Date DESC
                     "ODBC may not contain the latest Plex SPC checksheets.",
                     "Timer predictions are experimental and must be validated manually against Plex cards.",
                     "Recorded_Checksheets=0 does not prove that an inspection is pending.",
+                    "Section operation may differ from the Job_Op_Key used when Plex records the checksheet.",
                     "Latest Workcenter Log event is historical across all parts in the Workcenter; it does not prove the job is currently active.",
                     "Job Status Production means started workflow stage, not confirmed running in Workcenter.",
                     *(
