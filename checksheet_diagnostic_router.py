@@ -308,7 +308,9 @@ ORDER BY wl.Log_Date DESC
                 [record["Inspection_Date"] for record in matching],
                 req.timer_anchor,
                 req.evaluation_at,
-                not truncated,
+                (not truncated and req.job_op_key is not None and
+                 (req.window_start is None or req.timer_anchor is None or req.window_start <= req.timer_anchor) and
+                 (req.window_end is None or req.evaluation_at is None or req.evaluation_at <= req.window_end)),
             )
             output.append({
                 **requirement,
