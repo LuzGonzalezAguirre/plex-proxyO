@@ -14,6 +14,7 @@ class ChecksheetDiagnosticRequest(BaseModel):
     part_key: int = Field(gt=0)
     control_plan_key: int = Field(gt=0)
     job_op_key: int | None = Field(default=None, gt=0)
+    operation_job_op_keys: dict[int, int] | None = None
     operation_numbers: list[int] | None = Field(default=None, max_length=30)
     include_workcenter_context: bool = True
     include_checksheet_downtime: bool = False
@@ -41,6 +42,12 @@ def make_checksheet_diagnostic_router(get_connection, verify_token, pcn=306713):
             raise HTTPException(422, "Timer datetimes must be naive Plex-local values.")
         if req.timer_anchor and req.timer_anchor > req.evaluation_at:
             raise HTTPException(422, "Timer anchor must be on or before evaluation_at.")
+        if req.operation_job_op_keys is not None:
+            if (not req.operation_job_op_keys or len(req.operation_job_op_keys) > 30
+                or any(op <= 0 or job <= 0 for op, job in req.operation_job_op_keys.items())):
+                raise HTTPException(422, "operation_job_op_keys requires 1-30 positive operation/job IDs.")
+            if req.job_op_key is not None:
+                raise HTTPException(422, "Use either job_op_key or operation_job_op_keys.")
         if req.operation_numbers is not None and (not req.operation_numbers or any(n <= 0 for n in req.operation_numbers)):
             raise HTTPException(422, "operation_numbers must contain 1 to 30 positive operation numbers.")
 
@@ -294,6 +301,12 @@ ORDER BY wl.Log_Date DESC
                 continue
             section_id = requirement["Section_ID"]
             matching = by_section.get(section_id, [])
+            if req.operation_job_op_keys is not None:
+                operation_job_key = req.operation_job_op_keys.get(requirement["Operation_Number"])
+                matching = [
+                    record for record in matching
+                    if operation_job_key is not None and record["Job_Operation_ID"] == operation_job_key
+                ]
             last = max(
                 (r for r in matching if r["Inspection_Date"] is not None),
                 key=lambda r: r["Inspection_Date"],
@@ -308,7 +321,7 @@ ORDER BY wl.Log_Date DESC
                 [record["Inspection_Date"] for record in matching],
                 req.timer_anchor,
                 req.evaluation_at,
-                (not truncated and req.job_op_key is not None and
+                (not truncated and (req.job_op_key is not None or req.operation_job_op_keys is not None) and
                  (req.window_start is None or req.timer_anchor is None or req.window_start <= req.timer_anchor) and
                  (req.window_end is None or req.evaluation_at is None or req.evaluation_at <= req.window_end)),
             )
@@ -336,6 +349,7 @@ ORDER BY wl.Log_Date DESC
                 "part_key": req.part_key,
                 "control_plan_key": req.control_plan_key,
                 "job_op_key": req.job_op_key,
+                "operation_job_op_keys": req.operation_job_op_keys,
                 "operation_numbers": req.operation_numbers,
                 "requirements_returned": len(output),
                 "timer_hypothesis_only": True,
