@@ -14,6 +14,7 @@ class ChecksheetDiagnosticRequest(BaseModel):
     control_plan_key: int = Field(gt=0)
     job_op_key: int | None = Field(default=None, gt=0)
     operation_numbers: list[int] | None = Field(default=None, max_length=30)
+    include_workcenter_context: bool = True
     window_start: datetime | None = None
     window_end: datetime | None = None
 
@@ -70,6 +71,20 @@ WHERE c.Plexus_Customer_No = {int(pcn)}
   AND c.Control_Plan_Key = {req.control_plan_key}
 ORDER BY c.Checksheet_No DESC
 """
+        # Workcenter Log operation can differ from Control Plan operations.
+        # This is historical context, NOT an authoritative active-job lookup.
+        context_sql = f"""
+SELECT TOP 30 wl.Job_Op_Key AS Job_Operation_ID,
+       wl.Part_Operation_Key AS Part_Operation_ID,
+       wl.Workcenter_Status_Key AS Workcenter_Status_ID,
+       wl.Log_Date AS Event_Date,
+       wl.Description AS Event_Description
+FROM Part_v_Workcenter_Log AS wl
+WHERE wl.Plexus_Customer_No = {int(pcn)}
+  AND wl.Workcenter_Key = {req.workcenter_key}
+  AND wl.Part_Key = {req.part_key}
+ORDER BY wl.Log_Date DESC
+"""
         conn = None
         try:
             conn = get_connection()
@@ -80,6 +95,11 @@ ORDER BY c.Checksheet_No DESC
             cursor.execute(checksheets_sql)
             headers = [column[0] for column in cursor.description]
             visible = [dict(zip(headers, row)) for row in cursor.fetchall()]
+            workcenter_events = []
+            if req.include_workcenter_context:
+                cursor.execute(context_sql)
+                headers = [column[0] for column in cursor.description]
+                workcenter_events = [dict(zip(headers, row)) for row in cursor.fetchall()]
         except Exception:
             # Do not expose DSN/connection details or credentials to clients.
             raise HTTPException(502, "Plex ODBC checksheet diagnostic query failed.")
@@ -87,6 +107,26 @@ ORDER BY c.Checksheet_No DESC
             if conn is not None:
                 conn.close()
 
+        # An event is a historical observation; the latest observed event
+        # does not establish current Production/Down/Idle state.
+        last_event = workcenter_events[0] if workcenter_events else None
+        workcenter_context = {
+            "source": "Part_v_Workcenter_Log",
+            "is_current_state_verified": False,
+            "latest_observed_job_op_key": last_event["Job_Operation_ID"] if last_event else None,
+            "latest_observed_part_operation_key": last_event["Part_Operation_ID"] if last_event else None,
+            "latest_observed_workcenter_status_key": last_event["Workcenter_Status_ID"] if last_event else None,
+            "latest_event_date": (
+                last_event["Event_Date"].isoformat()
+                if last_event and last_event["Event_Date"] is not None else None
+            ),
+            "latest_event_description": last_event["Event_Description"] if last_event else None,
+            "events_returned": len(workcenter_events),
+            "recent_job_op_keys": list(dict.fromkeys(
+                event["Job_Operation_ID"] for event in workcenter_events
+                if event["Job_Operation_ID"] is not None
+            )),
+        }
         truncated = len(visible) > 5000
         visible = visible[:5000]
         by_section = defaultdict(list)
@@ -140,6 +180,7 @@ ORDER BY c.Checksheet_No DESC
                 "job_op_key": req.job_op_key,
                 "operation_numbers": req.operation_numbers,
                 "requirements_returned": len(output),
+                "workcenter_context": workcenter_context if req.include_workcenter_context else None,
                 "window_start": req.window_start.isoformat() if req.window_start else None,
                 "window_end": req.window_end.isoformat() if req.window_end else None,
                 "requirements": output,
@@ -153,6 +194,7 @@ ORDER BY c.Checksheet_No DESC
                 "warnings": [
                     "ODBC may not contain the latest Plex SPC checksheets.",
                     "Recorded_Checksheets=0 does not prove that an inspection is pending.",
+                    "Latest Workcenter Log event is historical; it does not prove the job is currently active.",
                     *(
                         ["Evidence capped at 5000 latest IDs; counts may be incomplete."]
                         if truncated else []
