@@ -7,6 +7,7 @@ from collections import defaultdict
 from datetime import datetime, timedelta
 from fastapi import APIRouter, HTTPException, Security
 from pydantic import BaseModel, Field
+from checksheet_timer_engine import evaluate_timer
 
 class ChecksheetDiagnosticRequest(BaseModel):
     workcenter_key: int = Field(gt=0)
@@ -16,6 +17,8 @@ class ChecksheetDiagnosticRequest(BaseModel):
     operation_numbers: list[int] | None = Field(default=None, max_length=30)
     include_workcenter_context: bool = True
     include_checksheet_downtime: bool = False
+    timer_anchor: datetime | None = None
+    evaluation_at: datetime | None = None
     window_start: datetime | None = None
     window_end: datetime | None = None
 
@@ -32,6 +35,12 @@ def make_checksheet_diagnostic_router(get_connection, verify_token, pcn=306713):
         if req.window_start and (req.window_start.tzinfo or req.window_end.tzinfo):
             raise HTTPException(422, "Provide naive Plex-local datetime values; timezone mapping is not verified.")
 
+        if (req.timer_anchor is None) != (req.evaluation_at is None):
+            raise HTTPException(422, "Provide timer_anchor and evaluation_at together.")
+        if req.timer_anchor and (req.timer_anchor.tzinfo or req.evaluation_at.tzinfo):
+            raise HTTPException(422, "Timer datetimes must be naive Plex-local values.")
+        if req.timer_anchor and req.timer_anchor > req.evaluation_at:
+            raise HTTPException(422, "Timer anchor must be on or before evaluation_at.")
         if req.operation_numbers is not None and (not req.operation_numbers or any(n <= 0 for n in req.operation_numbers)):
             raise HTTPException(422, "operation_numbers must contain 1 to 30 positive operation numbers.")
 
@@ -294,8 +303,16 @@ ORDER BY wl.Log_Date DESC
                 requirement["Required_Interval_Minutes"] == -1
                 and not requirement["Required_Per_Shift"]
             )
+            timer = evaluate_timer(
+                requirement,
+                [record["Inspection_Date"] for record in matching],
+                req.timer_anchor,
+                req.evaluation_at,
+                not truncated,
+            )
             output.append({
                 **requirement,
+                "Timer_Diagnostic": timer,
                 "Recorded_Checksheets": len(matching),
                 "Last_Checksheet_ID": last["Checksheet_ID"] if last else None,
                 "Last_Inspection_Date": last["Inspection_Date"].isoformat() if last else None,
@@ -319,6 +336,7 @@ ORDER BY wl.Log_Date DESC
                 "job_op_key": req.job_op_key,
                 "operation_numbers": req.operation_numbers,
                 "requirements_returned": len(output),
+                "timer_hypothesis_only": True,
                 "checksheet_downtime": {
                     "periods": downtime_periods,
                     "events_scanned": len(downtime_events),
@@ -339,6 +357,7 @@ ORDER BY wl.Log_Date DESC
                 "teams_notifications_enabled": False,
                 "warnings": [
                     "ODBC may not contain the latest Plex SPC checksheets.",
+                    "Timer predictions are experimental and must be validated manually against Plex cards.",
                     "Recorded_Checksheets=0 does not prove that an inspection is pending.",
                     "Latest Workcenter Log event is historical across all parts in the Workcenter; it does not prove the job is currently active.",
                     "Job Status Production means started workflow stage, not confirmed running in Workcenter.",
