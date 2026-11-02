@@ -15,6 +15,7 @@ class ChecksheetDiagnosticRequest(BaseModel):
     job_op_key: int | None = Field(default=None, gt=0)
     operation_numbers: list[int] | None = Field(default=None, max_length=30)
     include_workcenter_context: bool = True
+    include_checksheet_downtime: bool = False
     window_start: datetime | None = None
     window_end: datetime | None = None
 
@@ -104,6 +105,27 @@ INNER JOIN Part_v_Job_Status AS js
 WHERE j.PCN = {int(pcn)}
   AND jo.Job_Op_Key = {{job_op_key}}
 """
+        # Use job-specific history, no SQL date comparisons (OpenAccess differs
+        # from Plex's SQL editor for literal datetime comparisons).
+        downtime_sql = None
+        if req.include_checksheet_downtime:
+            if req.job_op_key is None:
+                raise HTTPException(422, "job_op_key is required for downtime analysis.")
+            downtime_sql = f"""
+SELECT TOP 501
+       wl.Job_Op_Key AS Job_Operation_ID,
+       wl.Part_Key AS Part_ID,
+       wl.Workcenter_Status_Key AS Workcenter_Status_ID,
+       wl.Log_Date AS Event_Date,
+       wl.Log_Hours AS Logged_Hours,
+       wl.Description AS Event_Description
+FROM Part_v_Workcenter_Log AS wl
+WHERE wl.Plexus_Customer_No = {int(pcn)}
+  AND wl.Workcenter_Key = {req.workcenter_key}
+  AND wl.Job_Op_Key = {req.job_op_key}
+ORDER BY wl.Log_Date DESC
+"""
+
         conn = None
         try:
             conn = get_connection()
@@ -119,6 +141,11 @@ WHERE j.PCN = {int(pcn)}
                 cursor.execute(context_sql)
                 headers = [column[0] for column in cursor.description]
                 workcenter_events = [dict(zip(headers, row)) for row in cursor.fetchall()]
+            downtime_events = []
+            if downtime_sql is not None:
+                cursor.execute(downtime_sql)
+                headers = [column[0] for column in cursor.description]
+                downtime_events = [dict(zip(headers, row)) for row in cursor.fetchall()]
             latest_job_record = None
             if workcenter_events and workcenter_events[0]["Job_Operation_ID"] is not None:
                 job_op_key = int(workcenter_events[0]["Job_Operation_ID"])
@@ -187,6 +214,58 @@ WHERE j.PCN = {int(pcn)}
                 if event["Job_Operation_ID"] is not None
             )),
         }
+        downtime_truncated = len(downtime_events) > 500
+        downtime_events = downtime_events[:500]
+        # The next event determines the end of a historical Down interval.
+        # This is not a claim that the downtime was automatic or that it was
+        # directly caused by a specific missing checksheet.
+        ordered_events = sorted(
+            (event for event in downtime_events if event["Event_Date"] is not None),
+            key=lambda event: event["Event_Date"],
+        )
+        downtime_periods = []
+        for index, event in enumerate(ordered_events):
+            if event["Workcenter_Status_ID"] != 5445 or (
+                "checksheet" not in str(event["Event_Description"] or "").lower()
+            ):
+                continue
+            start = event["Event_Date"]
+            # Only a subsequent event from this Job in the fetched set
+            # establishes a bounded period. No inferred active downtime.
+            following = ordered_events[index + 1] if index + 1 < len(ordered_events) else None
+            end = following["Event_Date"] if following else None
+            if req.window_start is not None and not (
+                start < req.window_end and (end is None or end > req.window_start)
+            ):
+                continue
+            matching_inspections = sorted(
+                (
+                    record for record in visible
+                    if record["Job_Operation_ID"] == req.job_op_key
+                    and record["Inspection_Date"] is not None
+                    and record["Inspection_Date"] >= start
+                    and (end is None or record["Inspection_Date"] < end)
+                ),
+                key=lambda record: record["Inspection_Date"],
+            )
+            downtime_periods.append({
+                "started_at": start.isoformat(),
+                "ended_at": end.isoformat() if end else None,
+                "duration_minutes": round((end - start).total_seconds() / 60, 2) if end else None,
+                "end_reason": "NEXT_OBSERVED_JOB_EVENT" if end else "NOT_OBSERVED",
+                "next_workcenter_status_key": following["Workcenter_Status_ID"] if following else None,
+                "reason": event["Event_Description"],
+                "checksheets_during_period": len(matching_inspections),
+                "checksheet_ids": [record["Checksheet_ID"] for record in matching_inspections],
+                "first_inspection_at": (
+                    matching_inspections[0]["Inspection_Date"].isoformat() if matching_inspections else None
+                ),
+                "last_inspection_at": (
+                    matching_inspections[-1]["Inspection_Date"].isoformat() if matching_inspections else None
+                ),
+                "causality_verified": False,
+            })
+
         truncated = len(visible) > 5000
         visible = visible[:5000]
         by_section = defaultdict(list)
@@ -240,6 +319,13 @@ WHERE j.PCN = {int(pcn)}
                 "job_op_key": req.job_op_key,
                 "operation_numbers": req.operation_numbers,
                 "requirements_returned": len(output),
+                "checksheet_downtime": {
+                    "periods": downtime_periods,
+                    "events_scanned": len(downtime_events),
+                    "events_truncated": downtime_truncated,
+                    "interval_rule": "From Down/Checksheets event to next observed event for the same Job",
+                    "causality_verified": False,
+                } if req.include_checksheet_downtime else None,
                 "workcenter_context": workcenter_context if req.include_workcenter_context else None,
                 "window_start": req.window_start.isoformat() if req.window_start else None,
                 "window_end": req.window_end.isoformat() if req.window_end else None,
@@ -256,6 +342,14 @@ WHERE j.PCN = {int(pcn)}
                     "Recorded_Checksheets=0 does not prove that an inspection is pending.",
                     "Latest Workcenter Log event is historical across all parts in the Workcenter; it does not prove the job is currently active.",
                     "Job Status Production means started workflow stage, not confirmed running in Workcenter.",
+                    *(
+                        ["Downtime motive Checksheets is recorded history, not proof Plex automatically blocked production."]
+                        if req.include_checksheet_downtime else []
+                    ),
+                    *(
+                        ["Downtime events capped at 500; historical intervals may be incomplete."]
+                        if downtime_truncated else []
+                    ),
                     *(
                         ["Evidence capped at 5000 latest IDs; counts may be incomplete."]
                         if truncated else []
