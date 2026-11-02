@@ -13,6 +13,7 @@ class ChecksheetDiagnosticRequest(BaseModel):
     part_key: int = Field(gt=0)
     control_plan_key: int = Field(gt=0)
     job_op_key: int | None = Field(default=None, gt=0)
+    operation_numbers: list[int] | None = Field(default=None, max_length=30)
     window_start: datetime | None = None
     window_end: datetime | None = None
 
@@ -28,6 +29,9 @@ def make_checksheet_diagnostic_router(get_connection, verify_token, pcn=306713):
             raise HTTPException(422, "Window must be positive and at most seven days.")
         if req.window_start and (req.window_start.tzinfo or req.window_end.tzinfo):
             raise HTTPException(422, "Provide naive Plex-local datetime values; timezone mapping is not verified.")
+
+        if req.operation_numbers is not None and (not req.operation_numbers or any(n <= 0 for n in req.operation_numbers)):
+            raise HTTPException(422, "operation_numbers must contain 1 to 30 positive operation numbers.")
 
         # Identifiers are validated integers; DataDirect rejects some pyodbc
         # parameter bindings, including timestamp parameters.
@@ -98,6 +102,8 @@ ORDER BY c.Checksheet_No DESC
 
         output = []
         for requirement in requirements:
+            if req.operation_numbers is not None and requirement["Operation_Number"] not in req.operation_numbers:
+                continue
             section_id = requirement["Section_ID"]
             matching = by_section.get(section_id, [])
             last = max(
@@ -132,6 +138,8 @@ ORDER BY c.Checksheet_No DESC
                 "part_key": req.part_key,
                 "control_plan_key": req.control_plan_key,
                 "job_op_key": req.job_op_key,
+                "operation_numbers": req.operation_numbers,
+                "requirements_returned": len(output),
                 "window_start": req.window_start.isoformat() if req.window_start else None,
                 "window_end": req.window_end.isoformat() if req.window_end else None,
                 "requirements": output,
