@@ -75,6 +75,7 @@ ORDER BY c.Checksheet_No DESC
         # This is historical context, NOT an authoritative active-job lookup.
         context_sql = f"""
 SELECT TOP 30 wl.Job_Op_Key AS Job_Operation_ID,
+       wl.Part_Key AS Part_ID,
        wl.Part_Operation_Key AS Part_Operation_ID,
        wl.Workcenter_Status_Key AS Workcenter_Status_ID,
        wl.Log_Date AS Event_Date,
@@ -82,7 +83,6 @@ SELECT TOP 30 wl.Job_Op_Key AS Job_Operation_ID,
 FROM Part_v_Workcenter_Log AS wl
 WHERE wl.Plexus_Customer_No = {int(pcn)}
   AND wl.Workcenter_Key = {req.workcenter_key}
-  AND wl.Part_Key = {req.part_key}
 ORDER BY wl.Log_Date DESC
 """
         conn = None
@@ -112,6 +112,9 @@ ORDER BY wl.Log_Date DESC
         last_event = workcenter_events[0] if workcenter_events else None
         workcenter_context = {
             "source": "Part_v_Workcenter_Log",
+            "scope": "ALL_PARTS_IN_WORKCENTER",
+            "requested_part_key": req.part_key,
+            "latest_observed_part_key": last_event["Part_ID"] if last_event else None,
             "is_current_state_verified": False,
             "latest_observed_job_op_key": last_event["Job_Operation_ID"] if last_event else None,
             "latest_observed_part_operation_key": last_event["Part_Operation_ID"] if last_event else None,
@@ -194,7 +197,7 @@ ORDER BY wl.Log_Date DESC
                 "warnings": [
                     "ODBC may not contain the latest Plex SPC checksheets.",
                     "Recorded_Checksheets=0 does not prove that an inspection is pending.",
-                    "Latest Workcenter Log event is historical; it does not prove the job is currently active.",
+                    "Latest Workcenter Log event is historical across all parts in the Workcenter; it does not prove the job is currently active.",
                     *(
                         ["Evidence capped at 5000 latest IDs; counts may be incomplete."]
                         if truncated else []
