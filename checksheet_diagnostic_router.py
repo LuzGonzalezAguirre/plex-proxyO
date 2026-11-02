@@ -295,6 +295,13 @@ ORDER BY wl.Log_Date DESC
                 continue
             by_section[record["Section_ID"]].append(record)
 
+        # The recording Job Op can be the shared production operation (905),
+        # even when a requirement belongs to operations 820/830/etc.
+        # Preserve an audit trail of *actual* capturing Job Op keys per section.
+        allowed_capturing_job_ops = (
+            set(req.operation_job_op_keys.values())
+            if req.operation_job_op_keys is not None else None
+        )
         output = []
         for requirement in requirements:
             if req.operation_numbers is not None and requirement["Operation_Number"] not in req.operation_numbers:
@@ -306,10 +313,9 @@ ORDER BY wl.Log_Date DESC
                 # using the currently executing Job_Op_Key (e.g. op 905).
                 # Treat mapping values as allowed capturing job operations,
                 # never demand a 1:1 section-operation correspondence.
-                allowed_capturing_jobs = set(req.operation_job_op_keys.values())
                 matching = [
                     record for record in matching
-                    if record["Job_Operation_ID"] in allowed_capturing_jobs
+                    if record["Job_Operation_ID"] in allowed_capturing_job_ops
                 ]
             last = max(
                 (r for r in matching if r["Inspection_Date"] is not None),
@@ -333,6 +339,15 @@ ORDER BY wl.Log_Date DESC
                 **requirement,
                 "Timer_Diagnostic": timer,
                 "Recorded_Checksheets": len(matching),
+                "Observed_Capture_Job_Op_Keys": sorted({
+                    int(record["Job_Operation_ID"]) for record in matching
+                    if record["Job_Operation_ID"] is not None
+                }),
+                "Evidence_Job_Scope": (
+                    "SINGLE_CAPTURING_JOB_OP" if req.job_op_key is not None
+                    else "UNION_OF_CAPTURING_JOB_OP_KEYS" if allowed_capturing_job_ops is not None
+                    else "ALL_JOBS_HISTORICAL"
+                ),
                 "Last_Checksheet_ID": last["Checksheet_ID"] if last else None,
                 "Last_Inspection_Date": last["Inspection_Date"].isoformat() if last else None,
                 "Evaluation": "NOT_REQUIRED" if no_requirement else "UNVERIFIED",
@@ -380,6 +395,10 @@ ORDER BY wl.Log_Date DESC
                     "ODBC may not contain the latest Plex SPC checksheets.",
                     "Timer predictions are experimental and must be validated manually against Plex cards.",
                     "Recorded_Checksheets=0 does not prove that an inspection is pending.",
+                    *(
+                        ["Evidence includes checksheets from all historical Jobs; supply job_op_key or operation_job_op_keys to isolate a production Job."]
+                        if req.job_op_key is None and req.operation_job_op_keys is None else []
+                    ),
                     "Section operation may differ from the Job_Op_Key used when Plex records the checksheet.",
                     "Latest Workcenter Log event is historical across all parts in the Workcenter; it does not prove the job is currently active.",
                     "Job Status Production means started workflow stage, not confirmed running in Workcenter.",
