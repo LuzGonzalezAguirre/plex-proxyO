@@ -85,6 +85,25 @@ WHERE wl.Plexus_Customer_No = {int(pcn)}
   AND wl.Workcenter_Key = {req.workcenter_key}
 ORDER BY wl.Log_Date DESC
 """
+        job_sql = f"""
+SELECT TOP 1
+       j.Job_Key AS Job_ID,
+       j.Job_No AS Job_Number,
+       j.Part_Key AS Job_Part_ID,
+       j.Job_Status_Key AS Job_Status_ID,
+       js.Job_Status AS Job_Status,
+       js.Started_Status AS Is_Started,
+       js.Completed_Status AS Is_Completed,
+       js.Cancelled_Status AS Is_Cancelled,
+       j.Completed_Date AS Completed_Date,
+       j.Finalized_Date AS Finalized_Date
+FROM Part_v_Job_Op AS jo
+INNER JOIN Part_v_Job AS j ON j.Job_Key = jo.Job_Key
+INNER JOIN Part_v_Job_Status AS js
+  ON js.Job_Status_Key = j.Job_Status_Key AND js.PCN = j.PCN
+WHERE j.PCN = {int(pcn)}
+  AND jo.Job_Op_Key = {{job_op_key}}
+"""
         conn = None
         try:
             conn = get_connection()
@@ -100,6 +119,14 @@ ORDER BY wl.Log_Date DESC
                 cursor.execute(context_sql)
                 headers = [column[0] for column in cursor.description]
                 workcenter_events = [dict(zip(headers, row)) for row in cursor.fetchall()]
+            latest_job_record = None
+            if workcenter_events and workcenter_events[0]["Job_Operation_ID"] is not None:
+                job_op_key = int(workcenter_events[0]["Job_Operation_ID"])
+                cursor.execute(job_sql.format(job_op_key=job_op_key))
+                headers = [column[0] for column in cursor.description]
+                job_row = cursor.fetchone()
+                if job_row is not None:
+                    latest_job_record = dict(zip(headers, job_row))
         except Exception:
             # Do not expose DSN/connection details or credentials to clients.
             raise HTTPException(502, "Plex ODBC checksheet diagnostic query failed.")
@@ -110,8 +137,38 @@ ORDER BY wl.Log_Date DESC
         # An event is a historical observation; the latest observed event
         # does not establish current Production/Down/Idle state.
         last_event = workcenter_events[0] if workcenter_events else None
+        # Job status describes workflow stage, not whether equipment is running.
+        job_stage = None
+        if last_event is not None and latest_job_record is not None:
+            job_stage = {
+                "job_key": latest_job_record["Job_ID"],
+                "job_number": latest_job_record["Job_Number"],
+                "part_key": latest_job_record["Job_Part_ID"],
+                "job_status_key": latest_job_record["Job_Status_ID"],
+                "job_status": latest_job_record["Job_Status"],
+                "is_started": bool(latest_job_record["Is_Started"]),
+                "is_completed": bool(latest_job_record["Is_Completed"]),
+                "is_cancelled": bool(latest_job_record["Is_Cancelled"]),
+                "completed_date": (
+                    latest_job_record["Completed_Date"].isoformat()
+                    if latest_job_record["Completed_Date"] is not None else None
+                ),
+                "finalized_date": (
+                    latest_job_record["Finalized_Date"].isoformat()
+                    if latest_job_record["Finalized_Date"] is not None else None
+                ),
+                "classification": (
+                    "HISTORICAL_COMPLETED_OR_CANCELLED"
+                    if latest_job_record["Is_Completed"] or latest_job_record["Is_Cancelled"]
+                    else "HISTORICAL_STARTED_JOB"
+                    if latest_job_record["Is_Started"]
+                    else "HISTORICAL_OTHER_STATUS"
+                ),
+                "is_currently_executing_verified": False,
+            }
         workcenter_context = {
             "source": "Part_v_Workcenter_Log",
+            "latest_job_stage": job_stage,
             "scope": "ALL_PARTS_IN_WORKCENTER",
             "requested_part_key": req.part_key,
             "latest_observed_part_key": last_event["Part_ID"] if last_event else None,
@@ -198,6 +255,7 @@ ORDER BY wl.Log_Date DESC
                     "ODBC may not contain the latest Plex SPC checksheets.",
                     "Recorded_Checksheets=0 does not prove that an inspection is pending.",
                     "Latest Workcenter Log event is historical across all parts in the Workcenter; it does not prove the job is currently active.",
+                    "Job Status Production means started workflow stage, not confirmed running in Workcenter.",
                     *(
                         ["Evidence capped at 5000 latest IDs; counts may be incomplete."]
                         if truncated else []
