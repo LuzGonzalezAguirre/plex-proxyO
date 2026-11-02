@@ -677,6 +677,68 @@ def demand(req: DemandRequest):
             conn.close()
 
 
+# ─── Lightweight Demand state monitoring ─────────────────────────────────────
+
+@app.post("/demand/status-snapshot", dependencies=[Security(verify_token)])
+def demand_status_snapshot(req: DemandRequest):
+    """Read current release fields only; no inventory or EDI-history lookups.
+
+    Keep the same Python Ship_Date filtering semantics as /demand until Plex
+    OpenAccess date predicate behavior can be validated independently.
+    """
+    if not req.start_date or not req.end_date:
+        raise HTTPException(status_code=400, detail="start_date y end_date son requeridas.")
+    try:
+        start = datetime.strptime(req.start_date, "%Y-%m-%d")
+        end = datetime.strptime(req.end_date, "%Y-%m-%d")
+        if end < start or (end - start).days > 400:
+            raise ValueError("invalid date range")
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Rango de fechas invalido.")
+    from datetime import timedelta
+    start_day = start.strftime("%Y-%m-%d")
+    end_exclusive = (end + timedelta(days=1)).strftime("%Y-%m-%d")
+
+    conn = None
+    try:
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute(f"""
+            SELECT
+                r.Release_Key AS Release_Key,
+                {CUSTOMER_CASE} AS Customer,
+                ISNULL(po.PO_No, '') AS PO_Rel,
+                p.Part_No + '.' + p.Revision AS Part_No_Rev,
+                r.Ship_Date AS Ship_Date,
+                r.Quantity AS Rel_Qty,
+                ISNULL(rs.Release_Status, 'Open') AS Rel_Status
+            FROM Sales_v_Release AS r
+            LEFT JOIN Sales_v_PO_Line AS pol
+                ON r.PO_Line_Key = pol.PO_Line_Key AND r.PCN = pol.PCN
+            LEFT JOIN Sales_v_PO AS po
+                ON pol.PO_Key = po.PO_Key AND r.PCN = po.PCN
+            LEFT JOIN Sales_v_Release_Status AS rs
+                ON r.Release_Status_Key = rs.Release_Status_Key AND r.PCN = rs.PCN
+            LEFT JOIN Part_v_Part AS p
+                ON pol.Part_Key = p.Part_Key AND r.PCN = p.Plexus_Customer_No
+            WHERE r.PCN = {PCN}
+        """)
+        rows = query_to_list(cursor)
+        result = [
+            row for row in rows
+            if row.get("Ship_Date") is not None
+            and start_day <= str(row["Ship_Date"])[:10] < end_exclusive
+        ]
+        return {"data": result}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+    finally:
+        if conn is not None:
+            conn.close()
+
+
 # ─── Shift range helper ───────────────────────────────────────────────────────
 
 def get_shift_range(report_date: str) -> tuple[str, str]:
