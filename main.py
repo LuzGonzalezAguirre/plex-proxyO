@@ -586,7 +586,7 @@ def demand(req: DemandRequest):
                             shippers_by_release.setdefault(int(release_key), set()).add(str(shipper_no))
 
                 for row in data:
-                    release_key = row.pop("Release_Key", None)
+                    release_key = row.get("Release_Key")
                     numbers = shippers_by_release.get(int(release_key), set()) if release_key is not None else set()
                     row["Shipper_No"] = ", ".join(sorted(numbers))
 
