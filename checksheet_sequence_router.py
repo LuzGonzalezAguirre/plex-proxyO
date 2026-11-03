@@ -7,6 +7,7 @@ to the current shift/model is NOT established by this endpoint.
 from fastapi import APIRouter, HTTPException, Security
 from pydantic import BaseModel, Field
 from checksheet_sequence_engine import reconstruct_sequence
+from checksheet_workcenter_summary import summarize_workcenter_group
 
 
 class ChecksheetSequenceRequest(BaseModel):
@@ -29,8 +30,12 @@ def make_checksheet_sequence_router(get_connection, verify_token, pcn=306713):
         # Validate that every requested section is active under the selected
         # Control Plan. The input list determines sequence order, not SQL order.
         config_sql = f"""
-SELECT cps.Section_Key AS Section_ID
+SELECT cps.Section_Key AS Section_ID,
+       im.Responsibility AS Responsibility
 FROM Quality_v_Control_Plan_Section AS cps
+INNER JOIN Quality_v_Inspection_Mode AS im
+  ON im.Plexus_Customer_No = cps.Plexus_Customer_No
+ AND im.Inspection_Mode_Key = cps.Inspection_Mode_Key
 WHERE cps.Plexus_Customer_No = {int(pcn)}
   AND cps.Control_Plan_Key = {req.control_plan_key}
   AND cps.Active = 1
@@ -54,8 +59,11 @@ ORDER BY c.Checksheet_No DESC
             conn = get_connection()
             cursor = conn.cursor()
             cursor.execute(config_sql)
-            configured = {int(row[0]) for row in cursor.fetchall()}
-            if configured != set(section_ids):
+            config = {
+                int(row[0]): {"responsibility": row[1]}
+                for row in cursor.fetchall()
+            }
+            if set(config) != set(section_ids):
                 raise HTTPException(422, "Some sections are not active in the specified Control Plan.")
             cursor.execute(evidence_sql)
             columns = [col[0] for col in cursor.description]
@@ -79,6 +87,9 @@ ORDER BY c.Checksheet_No DESC
         ])
         # Truncation can remove the start of the oldest observed attempt.
         # Never treat this evidence as authoritative current compliance.
+        workcenter_summary = summarize_workcenter_group(
+            section_ids, config, result, truncated
+        )
         return {"data": {
             "workcenter_key": req.workcenter_key,
             "part_key": req.part_key,
@@ -87,6 +98,7 @@ ORDER BY c.Checksheet_No DESC
             "evidence_truncated": truncated,
             "history_scope": "ALL_CAPTURING_JOBS_FOR_WC_PART_PLAN_SECTIONS",
             "sequence": result,
+            "workcenter_summary": workcenter_summary,
             "pending_status_verified": False,
             "teams_notifications_enabled": False,
             "warnings": [
