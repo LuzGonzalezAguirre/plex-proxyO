@@ -99,6 +99,29 @@ class TestChecksheetCaptureScope(unittest.TestCase):
                    if "Quality_v_Checksheet" in s)
         self.assertIn("AND c.Job_Op_Key IN (188312299, 188522218)", sql)
 
+    def test_section_filter_is_pushed_before_top_and_limits_requirements(self):
+        data = self.endpoint(
+            self.request(section_ids=[2345981])
+        )["data"]
+        sql = next(statement for statement in self.connection.fake_cursor.executed_sql
+                   if "Quality_v_Checksheet" in statement)
+        self.assertIn("AND c.Section_Key IN (2345981)", sql)
+        self.assertIn("SELECT TOP 5001", sql)
+        self.assertEqual(data["section_ids"], [2345981])
+        self.assertEqual([r["Section_ID"] for r in data["requirements"]], [2345981])
+
+    def test_section_filter_rejects_duplicate_ids(self):
+        from fastapi import HTTPException
+        with self.assertRaises(HTTPException) as error:
+            self.endpoint(self.request(section_ids=[2345981, 2345981]))
+        self.assertEqual(error.exception.status_code, 422)
+
+    def test_section_filter_rejects_empty_ids(self):
+        from fastapi import HTTPException
+        with self.assertRaises(HTTPException) as error:
+            self.endpoint(self.request(section_ids=[]))
+        self.assertEqual(error.exception.status_code, 422)
+
     def test_unscoped_query_keeps_all_jobs_for_historical_review(self):
         self.endpoint(self.request())
         sql = next(s for s in self.connection.fake_cursor.executed_sql
