@@ -16,6 +16,7 @@ class ChecksheetDiagnosticRequest(BaseModel):
     job_op_key: int | None = Field(default=None, gt=0)
     operation_job_op_keys: dict[int, int] | None = None
     operation_numbers: list[int] | None = Field(default=None, max_length=30)
+    section_ids: list[int] | None = Field(default=None, max_length=100)
     include_workcenter_context: bool = True
     include_checksheet_downtime: bool = False
     timer_anchor: datetime | None = None
@@ -50,6 +51,13 @@ def make_checksheet_diagnostic_router(get_connection, verify_token, pcn=306713):
                 raise HTTPException(422, "Use either job_op_key or operation_job_op_keys.")
         if req.operation_numbers is not None and (not req.operation_numbers or any(n <= 0 for n in req.operation_numbers)):
             raise HTTPException(422, "operation_numbers must contain 1 to 30 positive operation numbers.")
+
+        if req.section_ids is not None and (
+            not req.section_ids
+            or len(set(req.section_ids)) != len(req.section_ids)
+            or any(section <= 0 for section in req.section_ids)
+        ):
+            raise HTTPException(422, "section_ids must contain 1-100 unique positive IDs.")
 
         # Identifiers are validated integers; DataDirect rejects some pyodbc
         # parameter bindings, including timestamp parameters.
@@ -87,6 +95,13 @@ ORDER BY po.Operation_No, cps.Section_Key
                 ", ".join(str(key) for key in capture_keys) + ")\n"
             )
 
+        section_scope_sql = ""
+        if req.section_ids is not None:
+            section_scope_sql = (
+                "  AND c.Section_Key IN (" +
+                ", ".join(str(section) for section in req.section_ids) + ")\n"
+            )
+
         # Limit per request and report truncation instead of silently
         # treating incomplete evidence as an absence.
         checksheets_sql = f"""
@@ -100,7 +115,7 @@ WHERE c.Plexus_Customer_No = {int(pcn)}
   AND c.Workcenter_Key = {req.workcenter_key}
   AND c.Part_Key = {req.part_key}
   AND c.Control_Plan_Key = {req.control_plan_key}
-{capture_scope_sql}ORDER BY c.Checksheet_No DESC
+{capture_scope_sql}{section_scope_sql}ORDER BY c.Checksheet_No DESC
 """
         # Workcenter Log operation can differ from Control Plan operations.
         # This is historical context, NOT an authoritative active-job lookup.
@@ -320,6 +335,8 @@ ORDER BY wl.Log_Date DESC
         for requirement in requirements:
             if req.operation_numbers is not None and requirement["Operation_Number"] not in req.operation_numbers:
                 continue
+            if req.section_ids is not None and requirement["Section_ID"] not in req.section_ids:
+                continue
             section_id = requirement["Section_ID"]
             matching = by_section.get(section_id, [])
             if req.operation_job_op_keys is not None:
@@ -385,6 +402,7 @@ ORDER BY wl.Log_Date DESC
                 "operation_job_op_keys": req.operation_job_op_keys,
                 "capture_job_op_scoping": "UNION_OF_SUPPLIED_CAPTURING_JOB_OP_KEYS",
                 "operation_numbers": req.operation_numbers,
+                "section_ids": req.section_ids,
                 "requirements_returned": len(output),
                 "timer_hypothesis_only": True,
                 "checksheet_downtime": {
