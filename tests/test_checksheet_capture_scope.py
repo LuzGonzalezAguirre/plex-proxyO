@@ -11,8 +11,10 @@ class FakeCursor:
     def __init__(self):
         self.description = []
         self.rows = []
+        self.executed_sql = []
 
     def execute(self, sql):
+        self.executed_sql.append(sql)
         if "Quality_v_Control_Plan_Section" in sql:
             names = ["Operation_Number", "Section_ID", "Inspection_Type",
                      "Responsible_Department", "Required_Per_Shift",
@@ -38,8 +40,11 @@ class FakeCursor:
 
 
 class FakeConnection:
+    def __init__(self):
+        self.fake_cursor = FakeCursor()
+
     def cursor(self):
-        return FakeCursor()
+        return self.fake_cursor
 
     def close(self):
         pass
@@ -47,8 +52,9 @@ class FakeConnection:
 
 class TestChecksheetCaptureScope(unittest.TestCase):
     def setUp(self):
+        self.connection = FakeConnection()
         router = make_checksheet_diagnostic_router(
-            lambda: FakeConnection(), lambda: True
+            lambda: self.connection, lambda: True
         )
         self.endpoint = next(
             route.endpoint for route in router.routes
@@ -77,6 +83,27 @@ class TestChecksheetCaptureScope(unittest.TestCase):
         self.assertEqual(by_op[820]["Evidence_Job_Scope"], "UNION_OF_CAPTURING_JOB_OP_KEYS")
         self.assertFalse(data["pending_status_verified"])
         self.assertFalse(data["teams_notifications_enabled"])
+
+    def test_single_job_filter_is_applied_before_top_limit(self):
+        self.endpoint(self.request(job_op_key=188522218))
+        sql = next(s for s in self.connection.fake_cursor.executed_sql
+                   if "Quality_v_Checksheet" in s)
+        self.assertIn("AND c.Job_Op_Key = 188522218", sql)
+        self.assertIn("SELECT TOP 5001", sql)
+
+    def test_multiple_capture_job_filter_is_applied_before_top_limit(self):
+        self.endpoint(self.request(operation_job_op_keys={
+            820: 188522218, 830: 188312299, 860: 188522218
+        }))
+        sql = next(s for s in self.connection.fake_cursor.executed_sql
+                   if "Quality_v_Checksheet" in s)
+        self.assertIn("AND c.Job_Op_Key IN (188312299, 188522218)", sql)
+
+    def test_unscoped_query_keeps_all_jobs_for_historical_review(self):
+        self.endpoint(self.request())
+        sql = next(s for s in self.connection.fake_cursor.executed_sql
+                   if "Quality_v_Checksheet" in s)
+        self.assertNotIn("AND c.Job_Op_Key", sql)
 
     def test_unscoped_evidence_is_labelled_historical(self):
         data = self.endpoint(self.request())["data"]
