@@ -73,6 +73,20 @@ WHERE cps.Plexus_Customer_No = {int(pcn)}
   AND cps.Active = 1
 ORDER BY po.Operation_No, cps.Section_Key
 """
+        # Push an explicitly requested capturing Job Op scope into ODBC
+        # BEFORE TOP 5001, not after fetching historical rows. This endpoint
+        # does not infer which previous Jobs Plex considers valid for a
+        # current production cycle: omit the scope to inspect WC history.
+        capture_scope_sql = ""
+        if req.job_op_key is not None:
+            capture_scope_sql = f"  AND c.Job_Op_Key = {req.job_op_key}\n"
+        elif req.operation_job_op_keys is not None:
+            capture_keys = sorted(set(req.operation_job_op_keys.values()))
+            capture_scope_sql = (
+                "  AND c.Job_Op_Key IN (" +
+                ", ".join(str(key) for key in capture_keys) + ")\n"
+            )
+
         # Limit per request and report truncation instead of silently
         # treating incomplete evidence as an absence.
         checksheets_sql = f"""
@@ -86,7 +100,7 @@ WHERE c.Plexus_Customer_No = {int(pcn)}
   AND c.Workcenter_Key = {req.workcenter_key}
   AND c.Part_Key = {req.part_key}
   AND c.Control_Plan_Key = {req.control_plan_key}
-ORDER BY c.Checksheet_No DESC
+{capture_scope_sql}ORDER BY c.Checksheet_No DESC
 """
         # Workcenter Log operation can differ from Control Plan operations.
         # This is historical context, NOT an authoritative active-job lookup.
