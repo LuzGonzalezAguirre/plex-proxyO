@@ -19,8 +19,8 @@ class Cursor:
     def execute(self, sql):
         self.sql.append(sql)
         if "Quality_v_Control_Plan_Section" in sql:
-            self.description = [("Section_ID",)]
-            self.rows = [(section,) for section in self.config]
+            self.description = [("Section_ID",), ("Responsibility",)]
+            self.rows = [(section, "CELL OPERATOR") for section in self.config]
         elif "Quality_v_Checksheet" in sql:
             names = ["Checksheet_ID", "Section_ID", "Job_Op_Key", "Inspection_Date"]
             self.description = [(name,) for name in names]
@@ -75,6 +75,13 @@ class TestSequenceRoute(unittest.TestCase):
         self.assertEqual(result["sequence"]["complete_cycles"], 1)
         self.assertEqual(result["sequence"]["last_completed_at"], "2026-10-28T06:55:04")
         self.assertFalse(result["pending_status_verified"])
+        self.assertEqual(result["workcenter_summary"]["department"], "PRODUCTION")
+        self.assertEqual(result["workcenter_summary"]["department_status"], "UNVERIFIED")
+        self.assertEqual(
+            result["workcenter_summary"]["historical_sequence_state"],
+            "LATEST_OBSERVED_SEQUENCE_COMPLETE"
+        )
+        self.assertFalse(result["workcenter_summary"]["alert_eligible"])
 
     def test_rejects_sections_not_in_plan(self):
         cursor = Cursor(config=SECTIONS[:4])
