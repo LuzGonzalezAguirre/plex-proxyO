@@ -716,7 +716,8 @@ def demand_status_snapshot(req: DemandRequest):
                 r.Due_Date AS Due_Date,
                 r.Quantity AS Rel_Qty,
                 ISNULL(r.Quantity_Shipped, 0) AS Shipped,
-                ISNULL(rs.Release_Status, 'Open') AS Rel_Status
+                ISNULL(rs.Release_Status, 'Open') AS Rel_Status,
+                ISNULL(rt.Release_Type, 'Firm (862)') AS Rel_Type
             FROM Sales_v_Release AS r
             LEFT JOIN Sales_v_PO_Line AS pol
                 ON r.PO_Line_Key = pol.PO_Line_Key AND r.PCN = pol.PCN
@@ -724,6 +725,8 @@ def demand_status_snapshot(req: DemandRequest):
                 ON pol.PO_Key = po.PO_Key AND r.PCN = po.PCN
             LEFT JOIN Sales_v_Release_Status AS rs
                 ON r.Release_Status_Key = rs.Release_Status_Key AND r.PCN = rs.PCN
+            LEFT JOIN Sales_v_Release_Type AS rt
+                ON r.Release_Type_Key = rt.Release_Type_Key AND r.PCN = rt.PCN
             LEFT JOIN Sales_v_PO_Status AS pos
                 ON po.PO_Status_Key = pos.PO_Status_Key AND r.PCN = pos.PCN
             LEFT JOIN Part_v_Part AS p
