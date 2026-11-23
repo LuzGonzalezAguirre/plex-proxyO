@@ -709,9 +709,15 @@ def demand_status_snapshot(req: DemandRequest):
                 {CUSTOMER_CASE} AS Customer,
                 ISNULL(po.PO_No, '') AS PO_Rel,
                 p.Part_No + '.' + p.Revision AS Part_No_Rev,
+                ISNULL(cp.Customer_Part_No, '') AS Cust_Part,
+                ISNULL(pos.PO_Status, 'Open') AS PO_Status,
+                ISNULL(r.Ship_To, '') AS Ship_To_Carrier,
                 r.Ship_Date AS Ship_Date,
+                r.Due_Date AS Due_Date,
                 r.Quantity AS Rel_Qty,
-                ISNULL(rs.Release_Status, 'Open') AS Rel_Status
+                ISNULL(r.Quantity_Shipped, 0) AS Shipped,
+                ISNULL(rs.Release_Status, 'Open') AS Rel_Status,
+                ISNULL(rt.Release_Type, 'Firm (862)') AS Rel_Type
             FROM Sales_v_Release AS r
             LEFT JOIN Sales_v_PO_Line AS pol
                 ON r.PO_Line_Key = pol.PO_Line_Key AND r.PCN = pol.PCN
@@ -719,8 +725,14 @@ def demand_status_snapshot(req: DemandRequest):
                 ON pol.PO_Key = po.PO_Key AND r.PCN = po.PCN
             LEFT JOIN Sales_v_Release_Status AS rs
                 ON r.Release_Status_Key = rs.Release_Status_Key AND r.PCN = rs.PCN
+            LEFT JOIN Sales_v_Release_Type AS rt
+                ON r.Release_Type_Key = rt.Release_Type_Key AND r.PCN = rt.PCN
+            LEFT JOIN Sales_v_PO_Status AS pos
+                ON po.PO_Status_Key = pos.PO_Status_Key AND r.PCN = pos.PCN
             LEFT JOIN Part_v_Part AS p
                 ON pol.Part_Key = p.Part_Key AND r.PCN = p.Plexus_Customer_No
+            LEFT JOIN Part_v_Customer_Part AS cp
+                ON pol.Customer_Part_Key = cp.Customer_Part_Key AND r.PCN = cp.Plexus_Customer_No
             WHERE r.PCN = {PCN}
         """)
         rows = query_to_list(cursor)
